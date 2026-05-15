@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}{{ q.id }} — Methods Exam Gen{% endblock %}
+{% block content %}
+<div class="audit-navbar">
+  {% if prev_qid %}
+    <a class="nav-btn" href="/admin/question/{{ prev_qid }}" data-key="prev">← {{ prev_qid }}</a>
+  {% else %}
+    <span class="nav-btn disabled">← (first)</span>
+  {% endif %}
+  {% if position %}
+    <span class="nav-pos">{{ position[0] }} / {{ position[1] }}</span>
+  {% endif %}
+  {% if next_qid %}
+    <a class="nav-btn" href="/admin/question/{{ next_qid }}" data-key="next">{{ next_qid }} →</a>
+  {% else %}
+    <span class="nav-btn disabled">(last) →</span>
+  {% endif %}
+  <span class="nav-hint">← / → keys to navigate</span>
+</div>
+
+<h1>{{ q.id }}</h1>
+<p class="lede">
+  {{ q.year }} Paper {{ q.paper }}
+  {% if q.section %}§{{ q.section }}{% endif %},
+  Q{{ q.question_number }}{% if q.part %}.{{ q.part }}{% endif %}
+  · {{ q.marks }} mark{{ '' if q.marks == 1 else 's' }}
+  · pages {{ q.source_page_start }}{% if q.source_page_end != q.source_page_start %}–{{ q.source_page_end }}{% endif %}
+  · extracted by <code>{{ q.extraction_model or '?' }}</code>
+</p>
+
+<div class="audit-grid">
+  <section>
+    <h2>Extracted (rendered)</h2>
+    <div class="card prompt">
+      {% if override %}
+        <div class="override-banner">manually overridden</div>
+        {{ (override.prompt_md or q.prompt_md) | replace('\n', '<br>') | safe }}
+      {% else %}
+        {{ q.prompt_md | replace('\n', '<br>') | safe }}
+      {% endif %}
+      {% if q.is_mc and q.mc_options_md %}
+        <ol type="A" class="mc-options">
+          {% for opt in q.mc_options_md | from_json %}
+            <li>{{ opt | safe }}</li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+      {% if q.has_diagram and q.diagram_path %}
+        <figure class="diagram">
+          <img src="/diagrams/{{ q.diagram_path | basename }}" alt="diagram for {{ q.id }}">
+        </figure>
+      {% endif %}
+    </div>
+
+    <h3>Raw markdown</h3>
+    <pre class="mono small">{{ q.prompt_md }}</pre>
+
+    {% if tags %}
+    <h2>Tags</h2>
+    <ul class="tags">
+      {% for t in tags %}
+        <li>
+          {% if t.is_primary %}<strong>primary:</strong> {% endif %}
+          AoS {{ t.aos }} · dot point {{ t.dot_point_sort_order }}
+          <span class="conf">({{ "%.2f"|format(t.confidence or 0) }} via {{ t.tagged_by }})</span>
+          <div class="dot-point-text">{{ t.dot_point_text }}</div>
+        </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if answer %}
+    <h2>Answer (examiner report)</h2>
+    {% if answer.answer_image_path %}
+      <figure class="answer-image">
+        <img src="/answers/{{ answer.answer_image_path | basename }}" alt="worked answer for {{ q.id }}">
+        <figcaption>Worked solution + marks distribution rendered from the examiner report (the screenshot is the canonical answer; the math doesn't survive plain-text extraction).</figcaption>
+      </figure>
+    {% endif %}
+    {% if answer.final_answer_md %}
+      <p><strong>Final answer:</strong> {{ answer.final_answer_md }}</p>
+    {% endif %}
+    <p class="small mono">source: {{ answer.source_report_path }}</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Source page{% if q.source_page_end != q.source_page_start %}s{% endif %}</h2>
+    {% for p in range(q.source_page_start, q.source_page_end + 1) %}
+      <figure class="source-page">
+        <img src="/source/{{ q.source_id }}/page/{{ p }}.png?dpi=150" alt="source page {{ p }}">
+        <figcaption>page {{ p }}</figcaption>
+      </figure>
+    {% endfor %}
+    {% if bbox %}
+      <p class="small mono">bbox: [{{ bbox|join(', ') }}]</p>
+    {% endif %}
+  </section>
+</div>
+
+<p><a href="/admin/questions">← back to all questions</a></p>
+
+<script>
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'ArrowLeft') {
+      const a = document.querySelector('a.nav-btn[data-key="prev"]');
+      if (a) { e.preventDefault(); window.location = a.href; }
+    } else if (e.key === 'ArrowRight') {
+      const a = document.querySelector('a.nav-btn[data-key="next"]');
+      if (a) { e.preventDefault(); window.location = a.href; }
+    }
+  });
+</script>
+{% endblock %}

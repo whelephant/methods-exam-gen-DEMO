@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Questions — Methods Exam Gen{% endblock %}
+{% block content %}
+<h1>Questions</h1>
+<p class="lede">{{ total }} total. Page {{ page }} ({{ per_page }} per page).</p>
+
+<form method="get" class="filters">
+  <label>AoS
+    <select name="aos">
+      <option value="">any</option>
+      {% for i in [1, 2, 3, 4] %}
+        <option value="{{ i }}" {% if filters.aos == i %}selected{% endif %}>{{ i }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Year <input type="number" name="year" value="{{ filters.year or '' }}" min="2016" max="2025"></label>
+  <label>Paper
+    <select name="paper">
+      <option value="">any</option>
+      <option value="1" {% if filters.paper == 1 %}selected{% endif %}>1</option>
+      <option value="2" {% if filters.paper == 2 %}selected{% endif %}>2</option>
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+  <a href="/admin/questions">reset</a>
+</form>
+
+{% if questions %}
+<table class="grid">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Year/Paper</th>
+      <th>Q</th>
+      <th>Marks</th>
+      <th>Prompt (truncated)</th>
+      <th>Tags</th>
+      <th>Pages</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for q in questions %}
+    <tr>
+      <td><a href="/admin/question/{{ q.id }}">{{ q.id }}</a></td>
+      <td>{{ q.year }} P{{ q.paper }}{% if q.section %} §{{ q.section }}{% endif %}</td>
+      <td>{{ q.question_number }}{% if q.part %}.{{ q.part }}{% endif %}</td>
+      <td>{{ q.marks or '—' }}</td>
+      <td class="mono small">{{ q.prompt_md[:120] }}{% if q.prompt_md|length > 120 %}…{% endif %}</td>
+      <td>{{ q.tags or '—' }}</td>
+      <td>{{ q.source_page_start }}{% if q.source_page_end != q.source_page_start %}–{{ q.source_page_end }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No questions extracted yet. Run the extraction pipeline to populate this view.</p>
+{% endif %}
+{% endblock %}

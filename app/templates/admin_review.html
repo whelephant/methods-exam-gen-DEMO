@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Review queue — Methods Exam Gen{% endblock %}
+{% block content %}
+<h1>Review queue</h1>
+<p class="lede">{{ items|length }} item{{ '' if items|length == 1 else 's' }} pending review.</p>
+
+{% if items %}
+<table class="grid">
+  <thead>
+    <tr>
+      <th>When</th>
+      <th>Source</th>
+      <th>Page</th>
+      <th>Question</th>
+      <th>Reason</th>
+      <th>Detail</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in items %}
+    <tr>
+      <td class="mono small">{{ r.created_at }}</td>
+      <td>{% if r.year %}{{ r.year }} P{{ r.paper }}{% else %}—{% endif %}</td>
+      <td>{{ r.page or '—' }}</td>
+      <td>{% if r.question_id %}<a href="/admin/question/{{ r.question_id }}">{{ r.question_id }}</a>{% else %}—{% endif %}</td>
+      <td><code>{{ r.reason }}</code></td>
+      <td class="small">{{ r.detail or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">Nothing in the queue. Either the pipeline hasn't run yet, or every extraction passed its quality check.</p>
+{% endif %}
+{% endblock %}

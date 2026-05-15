@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<style>
+  /* --- print/page defaults --- */
+  @page { size: A4; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: #111;
+    font-size: 11pt;
+    line-height: 1.45;
+  }
+  /* --- cover (modelled on the 2025 VCAA Mathematical Methods Examination 2 cover) --- */
+  .cover {
+    page-break-after: always;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 4mm 4mm 6mm 4mm;
+    min-height: 260mm;   /* near full A4 content height, lets `margin-top: auto` on footer push to bottom */
+  }
+  .cover .footer { margin-top: auto; }
+  /* Student name + date box sits at the top right where VCAA puts the supervisor /
+     student-number boxes. Per user request we keep our own student-name/date inputs. */
+  .cover .student-box {
+    margin-left: auto;
+    width: 88mm;
+    border: 0.6pt solid #111;
+    padding: 5mm 6mm;
+    font-size: 10pt;
+    margin-bottom: 14mm;
+  }
+  .cover .student-box .label {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #444;
+    font-size: 8.5pt;
+    margin-bottom: 1.5mm;
+  }
+  .cover .student-box .line {
+    border-bottom: 0.6pt solid #888;
+    height: 7mm;
+    margin-bottom: 3mm;
+  }
+  .cover .student-box .line:last-child { margin-bottom: 0; }
+  .cover .title-block h1 {
+    font-size: 28pt;
+    font-weight: 600;
+    margin: 0;
+    line-height: 1.05;
+    color: #111;
+    letter-spacing: -0.01em;
+  }
+  .cover .title-block h2 {
+    font-size: 22pt;
+    font-weight: 400;
+    margin: 1mm 0 0 0;
+    line-height: 1.1;
+    color: #111;
+  }
+  .cover .title-block .subtype {
+    font-size: 14pt;
+    font-weight: 400;
+    margin: 3mm 0 0 0;
+    color: #111;
+  }
+  .cover .cover-subtitle {
+    font-size: 11pt;
+    color: #444;
+    margin: 3mm 0 0 0;
+  }
+  .cover hr.divider {
+    border: none;
+    border-top: 0.7pt solid #111;
+    margin: 6mm 0;
+  }
+  .cover .info-block h3 {
+    font-size: 11pt;
+    font-weight: 700;
+    margin: 4mm 0 1.5mm 0;
+    color: #111;
+  }
+  .cover .info-block ul {
+    margin: 0;
+    padding-left: 5mm;
+    font-size: 10.5pt;
+  }
+  .cover .info-block li {
+    padding: 0.4mm 0;
+  }
+  /* 2025 VCAA cover style: one line per section, label LEFT, totals RIGHT,
+     dotted leader filling the gap. Each row is its own flex container. */
+  .cover .contents-block h3 {
+    font-size: 11pt;
+    font-weight: 700;
+    margin: 0 0 3mm 0;
+    color: #111;
+  }
+  .cover .contents-block .toc-row {
+    display: flex;
+    align-items: baseline;
+    gap: 3mm;
+    font-size: 10.5pt;
+    padding: 1.5mm 0;
+    border-bottom: 0.3pt dotted #c5c5c5;
+  }
+  .cover .contents-block .toc-row .label { font-weight: 500; color: #111; }
+  .cover .contents-block .toc-row .leader {
+    flex: 1;
+    border-bottom: 0.4pt dotted #888;
+    transform: translateY(-2pt);
+    min-width: 6mm;
+  }
+  .cover .contents-block .toc-row .right {
+    font-variant-numeric: tabular-nums;
+    color: #333;
+    white-space: nowrap;
+  }
+  .cover .contents-block .toc-row.total {
+    font-weight: 700;
+    border-bottom: none;
+    margin-top: 2mm;
+    padding-top: 2.5mm;
+    border-top: 0.5pt solid #333;
+  }
+  .cover .contents-block .toc-row.total .right { color: #111; }
+  .cover .footer {
+    margin-top: 16mm;
+    padding-top: 4mm;
+    border-top: 0.3pt solid #ddd;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 8.5pt;
+    color: #888;
+  }
+  .cover .footer .meg-logo {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #555;
+  }
+
+  /* --- section dividers --- */
+  h2.section-title {
+    font-size: 14pt;
+    margin: 0 0 6mm 0;
+    padding-bottom: 2mm;
+    border-bottom: 2px solid #003f7d;
+    color: #003f7d;
+    font-weight: 600;
+  }
+
+  /* --- questions --- */
+  .question {
+    /* Allow large multi-part questions (Paper 2 Section B can be 4+ pages) to flow
+       across page breaks. Keep .part itself unbreakable below so a single sub-part
+       (prompt + working lines) doesn't split mid-prompt. */
+    margin-bottom: 8mm;
+  }
+  /* Every Paper 2 Section B question starts on its own page — that's how the real
+     VCAA paper is laid out (Q1 begins at page 10 with a clean run of pages for each
+     extended-response). Side-effect: also creates the implicit page break BETWEEN
+     Section A (MC) and Section B, since Section B's first question gets a fresh page. */
+  .question.section-B {
+    page-break-before: always;
+    break-before: page;
+  }
+  .question-header {
+    break-after: avoid-page;
+  }
+  .question-header {
+    font-weight: 600;
+    font-size: 12pt;
+    margin: 4mm 0 3mm 0;
+    color: #003f7d;
+  }
+  .question-source {
+    font-size: 8.5pt;
+    color: #888;
+    font-weight: 400;
+    margin-left: 4mm;
+  }
+  .stem {
+    margin: 0 0 4mm 0;
+  }
+  .sub-stem {
+    margin: 4mm 0 3mm 0;
+    break-inside: avoid-page;
+  }
+  .sub-stem p:first-child { margin-top: 0; }
+  .sub-stem p:last-child { margin-bottom: 0; }
+
+  /* Tables inside question prompts (e.g. Newton's method fill-in tables, function-value tables). */
+  table {
+    border-collapse: collapse;
+    margin: 3mm 0;
+    font-size: 11pt;
+  }
+  table th, table td {
+    border: 0.6pt solid #555;
+    padding: 8mm 5mm;
+    min-width: 22mm;
+    text-align: center;
+  }
+  /* Header / label cells (typically narrower, contain the row/column key like x₀, x₁). */
+  table tbody td:first-child { padding: 8mm 4mm; min-width: 14mm; background: #fafafa; }
+  table thead th { background: #f5f5f5; padding: 4mm 5mm; }
+
+  /* Fill-in bullet lists inside question prompts (e.g. Q5.a "Complete a possible
+     sequence of transformations" — students write their answer between bullets). */
+  .part .body ul {
+    padding-left: 6mm;
+    margin: 3mm 0;
+  }
+  .part .body ul li {
+    padding-bottom: 9mm;
+    line-height: 1.5;
+  }
+  .part .body ul li:last-child {
+    padding-bottom: 3mm;
+  }
+  .part {
+    display: grid;
+    grid-template-columns: 8mm 1fr auto;
+    column-gap: 3mm;
+    margin: 3mm 0 3mm 0;
+    break-inside: avoid-page;
+  }
+  .part .label {
+    font-weight: 600;
+  }
+  .part .body { min-width: 0; }
+  .part .body p:first-child { margin-top: 0; }
+  .part .body p:last-child { margin-bottom: 0; }
+  .part .marks {
+    color: #555;
+    font-size: 10pt;
+    white-space: nowrap;
+  }
+  /* Proportional working lines for student responses. Spans full width
+     across the .part grid via grid-column: 1 / -1. Faint horizontal rules
+     matching the visual density of real VCAA exam papers (~4 lines per mark). */
+  .working-lines {
+    grid-column: 1 / -1;
+    margin: 2mm 0 5mm 0;
+  }
+  .working-lines .line {
+    border-bottom: 0.4pt solid #b3b3b3;
+    height: 10mm;
+  }
+  .diagram {
+    margin: 4mm 0;
+    text-align: center;
+  }
+  .diagram img {
+    max-width: 100%;
+    max-height: 90mm;
+    object-fit: contain;
+  }
+  .mc-options {
+    list-style: upper-alpha;
+    padding-left: 6mm;
+    margin: 2mm 0 2mm 0;
+  }
+  .mc-options li {
+    padding: 1mm 0;
+  }
+  /* Diagram-option MC (e.g. 2023 P2 §A Q15 — five normal-pdf plots labelled A..E).
+     2-column grid; each panel has the option letter inline on the left. */
+  .mc-options-diagram {
+    list-style: none;
+    padding: 0;
+    margin: 3mm 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3mm 6mm;
+  }
+  .mc-options-diagram li {
+    display: grid;
+    grid-template-columns: 7mm 1fr;
+    align-items: start;
+    break-inside: avoid-page;
+  }
+  .mc-options-diagram .opt-label {
+    font-weight: 600;
+    font-size: 11pt;
+  }
+  .mc-options-diagram img {
+    max-width: 100%;
+    object-fit: contain;
+  }
+
+  /* Pseudocode / algorithm blocks in MC question prompts (2023+ algorithms content). */
+  pre {
+    background: #f7f7f7;
+    border: 0.5pt solid #ddd;
+    border-radius: 1mm;
+    padding: 3mm 4mm;
+    margin: 3mm 0;
+    font-size: 10pt;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.95em;
+  }
+  p code {
+    background: #f0f0f0;
+    padding: 0.5mm 1.5mm;
+    border-radius: 1mm;
+  }
+
+  /* --- answer key --- */
+  .answer-key-cover {
+    page-break-before: always;
+    page-break-after: always;
+    padding-top: 35mm;
+  }
+  .answer-key-cover h1 {
+    font-size: 22pt;
+    color: #003f7d;
+    margin: 0;
+  }
+  .answer-key-cover p {
+    font-size: 11pt;
+    color: #555;
+    margin-top: 4mm;
+  }
+  .answer-entry {
+    break-inside: avoid-page;
+    margin-bottom: 10mm;
+  }
+  .answer-entry .qhead {
+    font-weight: 600;
+    color: #003f7d;
+    margin: 6mm 0 3mm 0;
+    font-size: 12pt;
+  }
+  .answer-entry img {
+    max-width: 100%;
+    display: block;
+    margin: 0 auto;
+    border: 1px solid #ccc;
+    padding: 2mm;
+  }
+  .answer-entry .source {
+    font-size: 8pt;
+    color: #888;
+    margin-top: 1mm;
+    text-align: right;
+  }
+  .answer-entry .section-tag {
+    font-size: 9pt;
+    color: #777;
+    font-weight: 400;
+  }
+  /* Section A MC answer block (text-based; no examiner-report image).
+     Rendered as a row of A..E chips with the correct one highlighted in green. */
+  .mc-answer {
+    border: 0.5pt solid #ccc;
+    padding: 4mm 5mm;
+    border-radius: 1mm;
+    background: #fafafa;
+    font-size: 10.5pt;
+  }
+  .mc-distribution {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    gap: 2mm;
+    flex-wrap: wrap;
+  }
+  .mc-distribution li {
+    display: flex;
+    align-items: baseline;
+    gap: 1.5mm;
+    padding: 1.5mm 3mm;
+    border-radius: 1mm;
+    border: 0.5pt solid #d0d0d0;
+    background: #fff;
+    min-width: 14mm;
+    font-size: 10pt;
+  }
+  .mc-distribution li.correct {
+    border: 0.8pt solid #2e7d32;
+    background: #e8f5e9;
+    box-shadow: 0 0 0 0.3pt #2e7d32 inset;
+  }
+  .mc-distribution li.correct .letter {
+    color: #1b5e20;
+  }
+  .mc-distribution .letter {
+    font-weight: 700;
+    font-size: 11pt;
+    color: #555;
+  }
+  .mc-distribution .pct {
+    color: #666;
+    font-variant-numeric: tabular-nums;
+  }
+  .mc-distribution li.correct .pct {
+    color: #1b5e20;
+    font-weight: 600;
+  }
+  .mc-commentary {
+    margin-top: 3mm;
+    padding-top: 2.5mm;
+    border-top: 0.3pt dashed #d0d0d0;
+    font-size: 10pt;
+    color: #333;
+  }
+
+  /* tighten any KaTeX inline display */
+  .katex { font-size: 1em; }
+</style>
+</head>
+<body>
+
+<!-- ============ COVER (2025 VCAA-style) ============ -->
+<section class="cover">
+  <div class="student-box">
+    <div class="label">Student name</div>
+    <div class="line"></div>
+    <div class="label">Date</div>
+    <div class="line"></div>
+  </div>
+
+  <div class="title-block">
+    <h1>Mathematical Methods</h1>
+    <h2>Practice Paper</h2>
+    <div class="subtype">Question and Answer Book</div>
+    <div class="cover-subtitle">Generated {{ generated_at }}{% if source_summary %} — drawn from {{ source_summary }}{% endif %}</div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="info-block">
+    <h3>Selection</h3>
+    <ul>
+      <li>{{ filters_summary }}</li>
+    </ul>
+
+    <h3>About this paper</h3>
+    <ul>
+      <li>Practice paper assembled from real VCAA past-examination questions.</li>
+      <li>Working space follows each sub-part proportional to its marks.</li>
+      <li>Answers, examiner commentary and response distributions are bound after the questions.</li>
+    </ul>
+  </div>
+
+  <hr class="divider">
+
+  <div class="contents-block">
+    <h3>Contents</h3>
+    {% for row in section_breakdown %}
+      <div class="toc-row">
+        <span class="label">{{ row.label }}</span>
+        <span class="leader"></span>
+        <span class="right">{{ row.n_questions }} question{{ '' if row.n_questions == 1 else 's' }}, {{ row.marks }} mark{{ '' if row.marks == 1 else 's' }}</span>
+      </div>
+    {% endfor %}
+    <div class="toc-row total">
+      <span class="label">Total</span>
+      <span class="leader"></span>
+      <span class="right">{{ groups | length }} question{{ '' if (groups | length) == 1 else 's' }}, {{ total_marks }} mark{{ '' if total_marks == 1 else 's' }}</span>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="meg-logo">VCE Hub</span>
+    <span>Source questions © VCAA. Used for educational practice.</span>
+  </div>
+</section>
+
+<!-- ============ QUESTIONS ============ -->
+<section class="questions">
+  <h2 class="section-title">Questions</h2>
+  {% for g in groups %}
+    <article class="question{% if g.section %} section-{{ g.section }}{% endif %}">
+      <div class="question-header">
+        {{ g.header }}
+        <span class="question-source">[{{ g.source_year }} Paper {{ g.source_paper }}{% if g.section %} §{{ g.section }}{% endif %}]</span>
+      </div>
+
+      {% if g.stem %}
+        <div class="stem">{{ g.stem.prompt_md | md | safe }}</div>
+        {% if g.stem.has_diagram and g.stem.diagram_path %}
+          <div class="diagram"><img src="{{ g.stem.diagram_path | abs_asset }}" alt=""></div>
+        {% endif %}
+      {% endif %}
+
+      {% for p in g.parts %}
+        {% set lower = (p.prompt_md or '') | lower %}
+        {% set is_sketch = ('sketch' in lower) or ('on the axes' in lower) or ('draw the' in lower) %}
+        {# Fill-in-the-bullets / fill-in-the-table parts: the answer space is the bullets/table in the prompt,
+           not horizontal working lines below. Require BOTH a fill-in cue ("complete the/a ...", "fill in")
+           AND structural bullets/table — bullets alone often just enumerate the problem setup (e.g.
+           2021 P1 Q5.b lists the transformations applied), which still needs working lines below. #}
+        {% set has_bullets = ('\n- ' in (p.prompt_md or '')) or ((p.prompt_md or '').startswith('- ')) %}
+        {% set has_table = '\n|' in (p.prompt_md or '') %}
+        {% set is_completion = ('complete a ' in lower) or ('complete the ' in lower) or ('fill in' in lower) %}
+        {% set is_fill_in = is_completion and (has_bullets or has_table) %}
+        {% set n_lines = (p.marks or 0) * 3 if (not p.is_mc and not is_sketch and not is_fill_in) else 0 %}
+        {% set sub = g.sub_stems_by_part.get(p.part) %}
+        {% if sub %}
+          <div class="sub-stem">
+            {{ sub.prompt_md | md | safe }}
+            {% if sub.has_diagram and sub.diagram_path %}
+              <div class="diagram"><img src="{{ sub.diagram_path | abs_asset }}" alt=""></div>
+            {% endif %}
+          </div>
+        {% endif %}
+        <div class="part">
+          <div class="label">{% if p.part %}{{ p.part }}.{% endif %}</div>
+          <div class="body">
+            {{ p.prompt_md | md | safe }}
+            {# In-question diagram (e.g. Q17 cylinder net) sits between the prompt and the options,
+               matching the VCAA source layout. Diagram-options MC (Q15) has has_diagram=0 so this
+               block is skipped — its options are rendered as the 2-column grid below. #}
+            {% if p.has_diagram and p.diagram_path %}
+              <div class="diagram"><img src="{{ p.diagram_path | abs_asset }}" alt=""></div>
+            {% endif %}
+            {% if p.is_mc and p.mc_options_md %}
+              {% set opts = p.mc_options_md | from_json %}
+              {% set first_kind = (opts[0].kind if opts and opts[0] is mapping else 'text') %}
+              {% if first_kind == 'diagram' %}
+                <ol class="mc-options-diagram">
+                  {% for opt in opts %}
+                    <li>
+                      <span class="opt-label">{{ ['A','B','C','D','E'][loop.index0] }}.</span>
+                      <span>{% if opt.path %}<img src="{{ opt.path | abs_asset }}" alt="option {{ ['A','B','C','D','E'][loop.index0] }}">{% else %}(missing diagram){% endif %}</span>
+                    </li>
+                  {% endfor %}
+                </ol>
+              {% else %}
+                <ol class="mc-options">
+                  {% for opt in opts %}
+                    <li>{% if opt is mapping %}{{ opt.md | md | safe }}{% else %}{{ opt | safe }}{% endif %}</li>
+                  {% endfor %}
+                </ol>
+              {% endif %}
+            {% endif %}
+          </div>
+          <div class="marks">{% if p.marks %}{{ p.marks }} mark{{ '' if p.marks==1 else 's' }}{% endif %}</div>
+          {% if n_lines > 0 %}
+            <div class="working-lines">
+              {% for _ in range(n_lines) %}<div class="line"></div>{% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </article>
+  {% endfor %}
+</section>
+
+<!-- ============ ANSWER KEY ============ -->
+<section class="answer-key-cover">
+  <h1>Answers</h1>
+  <p>Worked solutions and commentary are taken verbatim from the VCAA examiner reports for the source papers shown on each question.</p>
+</section>
+
+<section class="answer-key">
+  {% for g in groups %}
+    {% if g.stem and answers.get(g.stem.id) %}
+      <div class="answer-entry">
+        <div class="qhead">Question {{ g.question_number }} — stem</div>
+        <img src="{{ answers[g.stem.id].answer_image_path | abs_asset }}" alt="">
+        <div class="source">{{ answers[g.stem.id].source_report_path }}</div>
+      </div>
+    {% endif %}
+    {% for p in g.parts %}
+      {% if answers.get(p.id) %}
+        <div class="answer-entry">
+          <div class="qhead">Question {{ g.question_number }}{% if p.part %}.{{ p.part }}{% endif %}{% if g.section %} <span class="section-tag">[§{{ g.section }}]</span>{% endif %}</div>
+          {% if answers[p.id].answer_image_path %}
+            <img src="{{ answers[p.id].answer_image_path | abs_asset }}" alt="">
+          {% else %}
+            {# Section A MC: structured render of correct letter + % distribution.
+               Commentary is suppressed when it has math gaps (MathType OLE drops). #}
+            {% set mc = answers[p.id].final_answer_md | mc_answer %}
+            <div class="mc-answer">
+              {% if mc %}
+                <ul class="mc-distribution">
+                  {% for d in mc.distribution %}
+                    <li class="{{ 'correct' if d.letter == mc.correct else 'other' }}">
+                      <span class="letter">{{ d.letter }}</span>
+                      <span class="pct">{{ d.pct }}%</span>
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+              {% set comm = answers[p.id].commentary_md %}
+              {% if comm and comm != '(no commentary)' and not (comm | has_math_gaps) %}
+                <div class="mc-commentary">{{ comm | md | safe }}</div>
+              {% endif %}
+            </div>
+          {% endif %}
+          <div class="source">{{ answers[p.id].source_report_path }}</div>
+        </div>
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
+</section>
+
+<!-- ============ KATEX RENDER ============ -->
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+        onload="
+          renderMathInElement(document.body, {
+            delimiters: [
+              {left: '$$', right: '$$', display: true},
+              {left: '$', right: '$', display: false},
+              {left: '\\\\(', right: '\\\\)', display: false},
+              {left: '\\\\[', right: '\\\\]', display: true}
+            ],
+            throwOnError: false
+          });
+          window.__katexReady = true;
+        "></script>
+</body>
+</html>

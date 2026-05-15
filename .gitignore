@@ -1,0 +1,43 @@
+.env
+.env.*
+!.env.example
+
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Database (regenerable from migrations / synced from Supabase)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.backup*
+
+# Pipeline caches
+pipeline/cache/
+
+# VCAA source material — not committed; lives locally + in Supabase Storage
+mathematical_methods/
+
+# Generated assets (diagram + answer crops) — uploaded to Supabase Storage
+assets/
+
+# Generated practice-paper PDFs
+out/
+
+# Node / web frontend (added later in phase 2)
+node_modules/
+.next/
+.vercel/
+.turbo/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/

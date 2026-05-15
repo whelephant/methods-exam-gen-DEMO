@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}Diagrams · {{ source.year }} P{{ source.paper }}{% endblock %}
+{% block content %}
+<style>
+  .bucket { margin: 6mm 0; }
+  .bucket h2 { font-size: 1.1rem; margin: 4mm 0 2mm 0; }
+  .bucket-count { color: #888; font-weight: 400; font-size: 0.9rem; }
+  table.diagrams { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  table.diagrams th, table.diagrams td { padding: 2.5mm 3mm; text-align: left; border-bottom: 1px solid #eee; vertical-align: middle; }
+  table.diagrams thead th { font-weight: 600; background: #fafafa; color: #555; }
+  table.diagrams tbody tr:hover { background: #f7f9fb; }
+  .preview { max-width: 110px; max-height: 60px; border: 1px solid #ddd; padding: 1px; background: #fff; }
+  .qid { font-family: "SF Mono", Menlo, monospace; font-size: 0.85rem; color: #444; }
+  .prompt-preview { color: #555; max-width: 380px; }
+  .btn { display: inline-block; padding: 1.5mm 3mm; border-radius: 2pt; text-decoration: none;
+         font-size: 0.85rem; color: #fff; background: #336699; }
+  .btn:hover { background: #1f4063; }
+  .btn.secondary { background: #fff; color: #336699; border: 1px solid #336699; }
+  .btn.secondary:hover { background: #eef3f8; }
+  .audit-row td { background: #fff8e6; }
+  .audit-actions form { display: inline; }
+  .audit-actions button { font-size: 0.85rem; padding: 1mm 2mm; cursor: pointer;
+                          border: 1px solid #aaa; background: #fff; border-radius: 2pt; }
+  .audit-actions button:hover { background: #eee; }
+  .dismiss-btn { background: none; border: none; color: #b33; cursor: pointer; font-size: 0.85rem; }
+</style>
+
+<h1>Diagram annotation · {{ source.year }} Paper {{ source.paper }}</h1>
+<p style="color:#666">
+  Source ID: {{ source.id }}. Manual bboxes override the vision-based extractor; they're
+  cropped instantly with no API cost. Saved annotations move from <em>To draw</em> to <em>Done</em>.
+</p>
+
+<section class="bucket">
+  <h2>To draw <span class="bucket-count">({{ to_draw|length }})</span></h2>
+  {% if to_draw %}
+    <table class="diagrams">
+      <thead>
+        <tr><th>Question</th><th>Page</th><th>Prompt</th><th>Method</th><th style="width:160px">Action</th></tr>
+      </thead>
+      <tbody>
+        {% for q in to_draw %}
+          <tr>
+            <td>
+              <span class="qid">{{ q.id }}</span>
+              {% if q.row_kind == 'option' %}<span style="color:#888"> — option {{ q.option_label }}</span>{% endif %}
+            </td>
+            <td>p{{ q.source_page_start }}</td>
+            <td class="prompt-preview">{{ (q.prompt_md or '')[:140] }}{% if (q.prompt_md or '')|length > 140 %}…{% endif %}</td>
+            <td>{{ 'mc-option' if q.row_kind == 'option' else q.method }}</td>
+            <td>
+              {% if q.row_kind == 'option' %}
+                <a class="btn" href="/admin/diagrams/{{ source.id }}/q/{{ q.id }}/opt/{{ q.option_label }}">Draw {{ q.option_label }}</a>
+              {% else %}
+                <a class="btn" href="/admin/diagrams/{{ source.id }}/q/{{ q.id }}">Draw box</a>
+                <button class="dismiss-btn" onclick="dismissDiagram('{{ q.id }}')">no diagram</button>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p style="color:#888">Nothing to draw — every flagged diagram has a manual bbox.</p>
+  {% endif %}
+</section>
+
+<section class="bucket">
+  <h2>Audit warnings <span class="bucket-count">({{ audit|length }})</span></h2>
+  <p style="color:#666; font-size:0.92rem">
+    Pages with many vector drawings but no question flagged as having a diagram —
+    review to catch diagrams the model may have missed.
+  </p>
+  {% if audit %}
+    <table class="diagrams">
+      <thead>
+        <tr><th>Page</th><th>Drawings on page</th><th>Questions on page</th><th style="width:200px">Action</th></tr>
+      </thead>
+      <tbody>
+        {% for row in audit %}
+          <tr class="audit-row">
+            <td>p{{ row.page }}</td>
+            <td>{{ row.drawings_count }}</td>
+            <td>
+              {% for q in row.questions %}
+                <span class="qid">{{ q.id }}</span>{% if not loop.last %},{% endif %}
+              {% endfor %}
+              {% if not row.questions %}<em style="color:#999">no questions on this page</em>{% endif %}
+            </td>
+            <td class="audit-actions">
+              <a class="btn secondary" target="_blank"
+                 href="/source/{{ source.id }}/page/{{ row.page }}.png?dpi=150">view page</a>
+              {% for q in row.questions %}
+                <button onclick="flagAsDiagram('{{ q.id }}', {{ source.id }})">flag {{ q.question_number }}{% if q.part %}.{{ q.part }}{% endif %}</button>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p style="color:#888">No audit warnings — every page with diagrams has at least one flagged question.</p>
+  {% endif %}
+</section>
+
+<section class="bucket">
+  <h2>Done <span class="bucket-count">({{ done|length }})</span></h2>
+  {% if done %}
+    <table class="diagrams">
+      <thead>
+        <tr><th>Question</th><th>Page</th><th>Crop</th><th style="width:120px">Action</th></tr>
+      </thead>
+      <tbody>
+        {% for q in done %}
+          <tr>
+            <td>
+              <span class="qid">{{ q.id }}</span>
+              {% if q.row_kind == 'option' %}<span style="color:#888"> — option {{ q.option_label }}</span>{% endif %}
+            </td>
+            <td>p{{ q.source_page_start }}</td>
+            <td>
+              {% if q.row_kind == 'option' %}
+                <img class="preview" src="/diagrams/{{ q.id }}-opt-{{ q.option_label }}.png?v={{ q.id|length }}{{ q.option_label }}" alt="">
+              {% elif q.diagram_path %}
+                <img class="preview" src="/diagrams/{{ q.id }}.png?v={{ q.id|length }}{{ q.source_page_start }}" alt="">
+              {% endif %}
+            </td>
+            <td>
+              {% if q.row_kind == 'option' %}
+                <a class="btn secondary" href="/admin/diagrams/{{ source.id }}/q/{{ q.id }}/opt/{{ q.option_label }}">Re-edit</a>
+              {% else %}
+                <a class="btn secondary" href="/admin/diagrams/{{ source.id }}/q/{{ q.id }}">Re-edit</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p style="color:#888">Nothing annotated yet.</p>
+  {% endif %}
+</section>
+
+<script>
+async function dismissDiagram(qid) {
+  if (!confirm("Mark " + qid + " as having no diagram?")) return;
+  const r = await fetch("/admin/diagrams/dismiss", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({question_id: qid}),
+  });
+  if (r.ok) location.reload(); else alert("dismiss failed");
+}
+async function flagAsDiagram(qid, sid) {
+  const r = await fetch("/admin/diagrams/flag", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({question_id: qid}),
+  });
+  if (r.ok) location.href = "/admin/diagrams/" + sid + "/q/" + qid;
+  else alert("flag failed");
+}
+</script>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Methods Exam Gen{% endblock %}
+{% block content %}
+<h1>Methods Exam Gen</h1>
+<p class="lede">Practice papers assembled from real VCAA past questions.</p>
+
+<section class="stats">
+  <div class="stat"><span class="n">{{ stats.sources }}</span><span class="l">sources</span></div>
+  <div class="stat"><span class="n">{{ stats.questions }}</span><span class="l">questions extracted</span></div>
+  <div class="stat"><span class="n">{{ stats.tagged }}</span><span class="l">tagged</span></div>
+  <div class="stat"><span class="n">{{ stats.answered }}</span><span class="l">with answers</span></div>
+  <div class="stat"><span class="n">{{ stats.review }}</span><span class="l">needs review</span></div>
+  <div class="stat"><span class="n">${{ "%.4f"|format(stats.spend_usd) }}</span><span class="l">API spend</span></div>
+</section>
+
+<section>
+  <h2>What to do next</h2>
+  <p>
+    The selection / generation UI lands in stage&nbsp;D once the question database is trustworthy.
+    For now, use the admin views to audit extraction progress:
+  </p>
+  <ul>
+    <li><a href="/admin/sources">Sources</a> — every (year, paper) PDF and whether its examiner report is matched.</li>
+    <li><a href="/admin/questions">Questions</a> — every extracted question (empty until stage&nbsp;B runs).</li>
+    <li><a href="/admin/review">Review queue</a> — anything the pipeline wasn't confident about.</li>
+  </ul>
+</section>
+{% endblock %}

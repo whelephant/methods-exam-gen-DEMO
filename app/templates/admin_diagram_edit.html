@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Draw · {{ q.id }}{% endblock %}
+{% block content %}
+<style>
+  .editor-wrap { display: flex; gap: 6mm; align-items: flex-start; margin-top: 4mm; }
+  .canvas-area { position: relative; flex: 0 0 auto; }
+  .canvas-area img.page { display: block; max-width: 800px; height: auto; border: 1px solid #ccc; }
+  .canvas-area canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  .sidebar { flex: 1; min-width: 280px; max-width: 360px; }
+  .sidebar .meta { background: #f6f7f9; border: 1px solid #e2e5ea; padding: 3mm 4mm; border-radius: 2pt;
+                    font-size: 0.92rem; }
+  .sidebar .meta dt { color: #888; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em;
+                       margin-top: 2mm; }
+  .sidebar .meta dd { margin: 0.5mm 0 0 0; word-break: break-word; }
+  .sidebar .prompt { max-height: 200px; overflow-y: auto; font-size: 0.92rem; }
+  .controls { margin: 4mm 0; }
+  .btn { padding: 2mm 3mm; border-radius: 2pt; text-decoration: none; cursor: pointer;
+         font-size: 0.92rem; border: 1px solid transparent; }
+  .btn.primary { background: #336699; color: #fff; }
+  .btn.primary:hover { background: #1f4063; }
+  .btn.primary[disabled] { background: #aaa; cursor: not-allowed; }
+  .btn.secondary { background: #fff; color: #336699; border-color: #336699; }
+  .btn.secondary:hover { background: #eef3f8; }
+  .btn.ghost { background: transparent; color: #555; border-color: #aaa; }
+  .bbox-readout { font-family: "SF Mono", Menlo, monospace; font-size: 0.85rem; color: #555; }
+  .preview-after-save { margin-top: 4mm; max-width: 360px; border: 1px solid #ddd; padding: 2pt; }
+  .position { color: #888; font-size: 0.85rem; }
+  .pagebar { display: flex; gap: 2mm; margin-bottom: 2mm; flex-wrap: wrap; }
+  .pagebar a { padding: 1mm 2.5mm; border: 1px solid #ccc; text-decoration: none; color: #555;
+                font-size: 0.9rem; border-radius: 2pt; }
+  .pagebar a.current { background: #336699; color: #fff; border-color: #336699; }
+  .pagebar a:hover { background: #eef3f8; }
+</style>
+
+<h1>
+  {% if mode == 'option' %}
+    Draw MC option {{ option_label }} bbox
+  {% else %}
+    Draw diagram bbox
+  {% endif %}
+  — <span style="font-family:monospace; font-size: 0.85em">{{ q.id }}{% if mode == 'option' %} · opt {{ option_label }}{% endif %}</span>
+</h1>
+<p class="position">
+  Position {{ position[0] }}/{{ position[1] }} ·
+  {{ q.year }} Paper {{ q.paper }}{% if q.section %} §{{ q.section }}{% endif %} ·
+  Q{{ q.question_number }}{% if q.part %}.{{ q.part }}{% endif %}{% if mode == 'option' %} · option {{ option_label }}{% endif %}
+</p>
+
+{# Page picker for multi-page questions (e.g. Section B Q1 spans pages 10-12) #}
+{% if q.source_page_start != q.source_page_end %}
+<div class="pagebar">
+  <span style="color:#888">Page:</span>
+  {% for p in range(q.source_page_start, q.source_page_end + 1) %}
+    <a href="?page={{ p }}" class="{{ 'current' if p == target_page else '' }}">p{{ p }}</a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="editor-wrap">
+  <div class="canvas-area">
+    <img id="page-img" class="page"
+         src="/source/{{ source_id }}/page/{{ target_page }}.png?dpi=150" alt="page {{ target_page }}">
+    <canvas id="bbox-canvas"></canvas>
+  </div>
+
+  <div class="sidebar">
+    <dl class="meta">
+      <dt>Marks</dt><dd>{{ q.marks if q.marks is not none else '—' }}</dd>
+      <dt>Source page</dt><dd>p{{ q.source_page_start }}{% if q.source_page_end != q.source_page_start %}–p{{ q.source_page_end }}{% endif %}</dd>
+      <dt>Prompt</dt><dd class="prompt">{{ q.prompt_md or '' }}</dd>
+    </dl>
+
+    <div class="controls">
+      <div>Bbox (normalised): <span id="bbox-readout" class="bbox-readout">none</span></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn primary" id="save-btn" disabled>Save</button>
+      <button class="btn primary" id="save-next-btn" disabled>Save & next</button>
+      <button class="btn ghost" id="clear-btn">Clear</button>
+    </div>
+
+    <div class="controls">
+      {% if mode == 'option' %}
+        {% if prev_option %}
+          <a class="btn secondary" href="/admin/diagrams/{{ source_id }}/q/{{ q.id }}/opt/{{ prev_option }}">← opt {{ prev_option }}</a>
+        {% endif %}
+        {% if next_option %}
+          <a class="btn secondary" href="/admin/diagrams/{{ source_id }}/q/{{ q.id }}/opt/{{ next_option }}">opt {{ next_option }} →</a>
+        {% endif %}
+      {% else %}
+        {% if prev_id %}
+          <a class="btn secondary" href="/admin/diagrams/{{ source_id }}/q/{{ prev_id }}">← prev</a>
+        {% endif %}
+        {% if next_id %}
+          <a class="btn secondary" href="/admin/diagrams/{{ source_id }}/q/{{ next_id }}">next →</a>
+        {% endif %}
+      {% endif %}
+      <a class="btn ghost" href="/admin/diagrams/{{ source_id }}">back to list</a>
+    </div>
+
+    <div id="preview-wrap" style="display:none">
+      <p style="margin: 4mm 0 1mm 0; font-size: 0.92rem; color:#555">Cropped preview:</p>
+      <img id="crop-preview" class="preview-after-save" alt="">
+    </div>
+
+    <p style="font-size: 0.8rem; color: #888; margin-top: 8mm">
+      Shortcuts: <kbd>Enter</kbd> save&next · <kbd>S</kbd> save · <kbd>Esc</kbd> clear ·
+      <kbd>N</kbd>/<kbd>P</kbd> next/prev question
+    </p>
+  </div>
+</div>
+
+<script>
+  window.__diagramCtx = {
+    questionId: {{ q.id|tojson }},
+    sourceId: {{ source_id|tojson }},
+    page: {{ target_page|tojson }},
+    existing: {{ existing_bbox|tojson }},
+    nextId: {{ (next_id or "")|tojson }},
+    prevId: {{ (prev_id or "")|tojson }},
+    mode: {{ (mode or "stem")|tojson }},
+    optionLabel: {{ (option_label or "")|tojson }},
+    nextOption: {{ (next_option or "")|tojson }},
+    prevOption: {{ (prev_option or "")|tojson }},
+  };
+</script>
+<script src="/static/diagram_annotator.js?v=2"></script>
+{% endblock %}

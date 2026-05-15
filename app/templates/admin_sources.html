@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Sources — Methods Exam Gen{% endblock %}
+{% block content %}
+<h1>Sources</h1>
+<p class="lede">{{ sources|length }} source PDFs registered.</p>
+
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Year</th>
+      <th>Paper</th>
+      <th>Era</th>
+      <th>PDF</th>
+      <th>Report</th>
+      <th>Questions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in sources %}
+    <tr>
+      <td>{{ s.year }}</td>
+      <td>{{ s.paper }}</td>
+      <td><span class="era era-{{ s.format_era }}">{{ s.format_era }}</span></td>
+      <td class="mono">{{ s.pdf_path }}</td>
+      <td class="mono">{{ s.report_path or '—' }}</td>
+      <td>{{ s.n_questions }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
