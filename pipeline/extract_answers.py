@@ -43,6 +43,8 @@ from pipeline.db import REPO_ROOT, connect
 
 ANSWERS_DIR = REPO_ROOT / "assets" / "answers"
 ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+MC_ROW_THUMBS_DIR = REPO_ROOT / "assets" / "mc_row_thumbs"
+MC_ROW_THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
 CONVERT_CACHE = REPO_ROOT / "pipeline" / "cache" / "answer_pdfs"
 CONVERT_CACHE.mkdir(parents=True, exist_ok=True)
@@ -406,6 +408,123 @@ def extract_mc_answers_from_docx(source_id: int, docx_path: Path,
     return results
 
 
+def crop_mc_answer_table_rows(report_path: Path, source_id: int, *, force: bool = False) -> dict:
+    """For an examiner-report PDF (or pre-converted docx-PDF), find the Section A
+    answer-key table and crop each Q-row to a PNG so the human-in-the-loop audit
+    UI can show the shaded cell directly.
+
+    Writes to assets/mc_row_thumbs/<source_id>-q<NN>.png. Returns the map
+    {question_number: relative_path}.
+    """
+    # If the report is docx, get the LibreOffice-rendered PDF.
+    if report_path.suffix.lower() == ".docx":
+        pdf_path = convert_docx_to_pdf(report_path)
+    else:
+        pdf_path = report_path
+
+    doc = fitz.open(pdf_path)
+    out: dict[int, str] = {}
+    try:
+        for pn in range(doc.page_count):
+            pg = doc.load_page(pn)
+            spans = []
+            for blk in pg.get_text("dict").get("blocks", []):
+                for ln in blk.get("lines", []):
+                    for sp in ln.get("spans", []):
+                        t = (sp.get("text") or "").strip()
+                        if not t: continue
+                        bb = sp["bbox"]
+                        spans.append({"text": t, "x": (bb[0]+bb[2])/2, "y": (bb[1]+bb[3])/2,
+                                      "x0": bb[0], "x1": bb[2], "y0": bb[1], "y1": bb[3]})
+            # Detect this is an answer-table page by presence of "% A" / "% B" headers
+            import re as _re
+            letter_xs = []
+            for s in spans:
+                if _re.match(r"^%\s*[A-E]$", s["text"]):
+                    letter_xs.append(s["x"])
+            if len(letter_xs) < 3:
+                continue
+
+            leftmost_letter_x = min(letter_xs)
+            # Q-number rows: digit spans 1..20 in the leftmost column of the table.
+            q_rows: list[tuple[int, dict]] = []
+            seen = set()
+            for s in sorted(spans, key=lambda s: s["y"]):
+                if not s["text"].isdigit():
+                    continue
+                qn = int(s["text"])
+                if not (1 <= qn <= 20):
+                    continue
+                if s["x"] >= leftmost_letter_x - 15:
+                    continue
+                if qn in seen:
+                    continue
+                seen.add(qn)
+                q_rows.append((qn, s))
+            # Sort by y to get document order, then derive row y-bounds.
+            q_rows.sort(key=lambda t: t[1]["y"])
+            page_h = pg.rect.height
+            for i, (qn, s) in enumerate(q_rows):
+                y_top = s["y0"] - 3
+                if i + 1 < len(q_rows):
+                    y_bot = q_rows[i + 1][1]["y0"] - 2
+                else:
+                    # Last row on this page — bound by table bottom (look for next non-row content or page edge)
+                    y_bot = min(s["y1"] + 60, page_h)
+                # x-range: from the Q-column left edge to a bit past the rightmost %E column
+                x_left = max(0, min(s["x0"] for _, s in q_rows) - 5)
+                rightmost_letter_x = max(letter_xs)
+                x_right = min(pg.rect.width, rightmost_letter_x + 60)
+                out_path = MC_ROW_THUMBS_DIR / f"{source_id}-q{qn:02d}.png"
+                if out_path.exists() and not force:
+                    out[qn] = str(out_path.relative_to(REPO_ROOT))
+                    continue
+                clip = fitz.Rect(x_left, y_top, x_right, y_bot)
+                pix = pg.get_pixmap(clip=clip, dpi=200)
+                pix.save(out_path)
+                out[qn] = str(out_path.relative_to(REPO_ROOT))
+    finally:
+        doc.close()
+    return out
+
+
+def _realign_to(target_header: list, src_table: list[list]) -> list[list]:
+    """Re-map src_table's rows onto target_header's column count.
+
+    PyMuPDF can extract the answer-key table with different sub-column counts on
+    different pages (e.g. 2016 P2: page 2's E-column spans 1 cell, page 3's spans
+    3 cells). We collapse each row to one value per NAMED header column — taking
+    the first non-empty value within the source's span — then place each value at
+    the same named column's position in the target. Within-span sub-positions are
+    discarded; the percentage values don't carry sub-cell semantics anyway.
+    """
+    def named_positions(hdr):
+        return [(i, (c or "").strip().lower()) for i, c in enumerate(hdr) if (c or "").strip()]
+
+    tgt_named = named_positions(target_header)
+    src_named = named_positions(src_table[0])
+    if len(tgt_named) != len(src_named):
+        return src_table[1:]  # last-resort: drop header, append as-is (may misalign)
+
+    out_width = len(target_header)
+    aligned: list[list] = []
+    for row in src_table[1:]:
+        new_row = [None] * out_width
+        for k, (sidx, _) in enumerate(src_named):
+            end = src_named[k + 1][0] if k + 1 < len(src_named) else len(row)
+            value = None
+            for i in range(sidx, min(end, len(row))):
+                v = row[i]
+                if v is not None and (str(v).strip() != ""):
+                    value = v
+                    break
+            if value is not None:
+                tgt_idx = tgt_named[k][0]
+                new_row[tgt_idx] = value
+        aligned.append(new_row)
+    return aligned
+
+
 def extract_mc_answers_from_pdf(source_id: int, pdf_path: Path,
                                   available_mc_qids: dict[int, str]) -> list[dict]:
     """PDF-native counterpart to `extract_mc_answers_from_docx`.
@@ -418,10 +537,19 @@ def extract_mc_answers_from_pdf(source_id: int, pdf_path: Path,
     """
     src = fitz.open(pdf_path)
     try:
-        # The answer-key table can span multiple pages — capture the first matching
-        # header table, then concatenate body rows from any continuation table on a
-        # later page that shares the same column count (continuation pages don't
-        # repeat the header).
+        # The answer-key table can span multiple pages. Some years (e.g. 2019) split
+        # the header across 2 rows because of wrapping in the "% No answer" cell —
+        # row 0 is empty, row 1 has the actual labels. So we scan the first ~3 rows
+        # of each candidate table for a row containing "% A", "% B", ..., and treat
+        # that row as the header (discarding rows above it).
+        def _find_header_row(data: list[list]) -> Optional[int]:
+            for ri in range(min(3, len(data))):
+                cells = [(c or "").strip().lower() for c in data[ri]]
+                joined = " ".join(cells)
+                if all(f"% {L.lower()}" in joined for L in ("A", "B", "C", "D")):
+                    return ri
+            return None
+
         chosen_table = None
         for pn in range(src.page_count):
             pg = src.load_page(pn)
@@ -433,18 +561,14 @@ def extract_mc_answers_from_pdf(source_id: int, pdf_path: Path,
                 data = tbl.extract()
                 if not data:
                     continue
-                header_cells = [(c or "").strip().lower() for c in data[0]]
-                joined = " ".join(header_cells)
-                has_pct_header = all(f"% {L.lower()}" in joined for L in ("A", "B", "C", "D"))
+                hdr_idx = _find_header_row(data)
                 if chosen_table is None:
-                    if has_pct_header:
-                        chosen_table = list(data)
-                elif len(data[0]) == len(chosen_table[0]):
-                    # Same column count → either continuation rows directly OR a
-                    # continuation table that re-prints the header. Strip the header
-                    # row if present, then append.
-                    rows_to_add = data[1:] if has_pct_header else data
-                    chosen_table.extend(rows_to_add)
+                    if hdr_idx is not None:
+                        chosen_table = data[hdr_idx:]
+                elif hdr_idx is not None:
+                    # Continuation table with repeated header — strip rows up to and
+                    # including the header, then re-align to chosen_table's columns.
+                    chosen_table.extend(_realign_to(chosen_table[0], data[hdr_idx:]))
         if chosen_table is None:
             return [{"status": "no_mc_table_found"}]
     finally:
@@ -463,7 +587,7 @@ def extract_mc_answers_from_pdf(source_id: int, pdf_path: Path,
     named_cols: list[tuple[int, str]] = [(i, h) for i, h in enumerate(header) if h]
     for k, (idx, h) in enumerate(named_cols):
         next_idx = named_cols[k + 1][0] if k + 1 < len(named_cols) else len(header)
-        if h == "question":
+        if h in ("question", "qu", "q"):
             q_col = idx
         elif h == "comments":
             comments_col = idx

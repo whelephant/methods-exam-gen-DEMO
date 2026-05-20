@@ -1,31 +1,40 @@
-"""FastAPI server for the exam generator.
+"""FastAPI server for VCE Hub.
 
-Routes:
-  GET  /                              landing page (selection form — wired in stage D)
-  GET  /admin/sources                 list registered source PDFs
-  GET  /admin/questions               paginated list of extracted questions
-  GET  /admin/question/{qid}          single-question audit view (extracted vs source)
-  GET  /admin/review                  pending-review queue (uncertain extractions/tags)
-  GET  /source/{sid}/page/{p}.png     render a source PDF page as PNG (for audit view)
-  GET  /diagrams/{filename}           serve an extracted diagram (PNG or SVG)
+Public (always on):
+  GET  /                              generator form
+  POST /generate.pdf                  generate a practice paper from form input
+  GET  /generate.pdf                  same, via legacy query params (year/paper/aos/dot)
+  GET  /diagrams/{filename}           serve an extracted diagram (PNG)
+  GET  /answers/{filename}            serve an examiner-report answer image
+  GET  /mc-row-thumbs/{filename}      serve a MC answer-table row thumbnail
+
+Admin (only registered when ADMIN=1 env var is set — local authoring tool):
+  GET  /admin/sources, /admin/questions, /admin/question/{qid}, /admin/review
+  GET  /admin/mc-answers/{sid}, POST /admin/mc-answers/save
+  GET  /admin/diagrams/{sid}, /admin/diagrams/{sid}/q/{qid}[/opt/{label}]
+  POST /admin/diagrams/save, /admin/diagrams/save_option, /diagrams/dismiss, /diagrams/flag
+  GET  /source/{sid}/page/{p}.png     render a source PDF page as PNG (admin audit)
 """
 from __future__ import annotations
 
 import io
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 import fitz  # pymupdf
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from pipeline.db import REPO_ROOT, connect
 
-app = FastAPI(title="Methods Exam Gen")
+ADMIN_ENABLED = os.environ.get("ADMIN") == "1"
+
+app = FastAPI(title="VCE Hub")
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -35,6 +44,7 @@ ANSWERS_DIR = REPO_ROOT / "assets" / "answers"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["from_json"] = lambda s: json.loads(s) if s else []
 templates.env.filters["basename"] = lambda s: Path(s).name if s else ""
+templates.env.globals["admin_enabled"] = ADMIN_ENABLED
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -169,7 +179,21 @@ def generate_pdf_route(
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
+    """Generator form. Loads the AoS / dot-point taxonomy and basic corpus stats."""
     with _db() as conn:
+        areas_rows = conn.execute(
+            """
+            select aos, title from study_areas
+            where subject = 'mathematical_methods' order by aos
+            """
+        ).fetchall()
+        points_rows = conn.execute(
+            """
+            select aos, sort_order, text from study_points
+            where subject = 'mathematical_methods' and is_header = 0
+            order by aos, sort_order
+            """
+        ).fetchall()
         stats = {
             "sources": conn.execute("select count(*) from sources").fetchone()[0],
             "questions": conn.execute("select count(*) from questions").fetchone()[0],
@@ -177,18 +201,98 @@ def index(request: Request) -> HTMLResponse:
                 "select count(distinct question_id) from question_tags"
             ).fetchone()[0],
             "answered":  conn.execute("select count(*) from answers").fetchone()[0],
-            "review":    conn.execute(
-                "select count(*) from review_queue where resolved = 0"
-            ).fetchone()[0],
-            "spend_usd": conn.execute(
-                "select coalesce(sum(cost_usd), 0.0) from extraction_log"
-            ).fetchone()[0],
         }
-    return templates.TemplateResponse("index.html", {"request": request, "stats": stats})
+    by_aos: dict[int, list] = {}
+    for p in points_rows:
+        by_aos.setdefault(p["aos"], []).append({"sort_order": p["sort_order"], "text": p["text"]})
+    areas = [{"aos": a["aos"], "title": a["title"], "points": by_aos.get(a["aos"], [])}
+             for a in areas_rows]
+    return templates.TemplateResponse(
+        request, "index.html", {"areas": areas, "stats": stats},
+    )
+
+
+@app.post("/generate.pdf")
+def generate_pdf_form(
+    dot: list[str] = Form(default_factory=list),
+    paper_type: str = Form(...),
+    duration_minutes: int = Form(...),
+    seed: Optional[int] = Form(None),
+) -> Response:
+    """Build a practice-paper PDF from the user-facing form.
+
+    Body (form-encoded):
+      dot[]: ["3.8", "4.5", ...]   — chosen dot points (aos.sort_order)
+      paper_type: "tech_free" | "mc" | "tech_active"
+      duration_minutes: int        — target marks ≈ duration / 1.5
+      seed: int (optional)         — for reproducibility tests
+    """
+    from app.render import generate_pdf  # local import to defer Playwright at boot
+    from app.select import (PAPER_TYPE_LABEL, dot_point_labels,
+                             pick_question_ids)
+
+    if paper_type not in PAPER_TYPE_LABEL:
+        raise HTTPException(status_code=400,
+                             detail=f"paper_type must be one of {list(PAPER_TYPE_LABEL)}")
+    if duration_minutes <= 0:
+        raise HTTPException(status_code=400, detail="duration_minutes must be positive")
+
+    chosen_dots: list[tuple[int, int]] = []
+    for d in dot:
+        try:
+            a, s = d.split(".", 1)
+            chosen_dots.append((int(a), int(s)))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400,
+                                 detail=f"bad dot point format: {d!r} (expected 'aos.sort_order')")
+    if not chosen_dots:
+        raise HTTPException(status_code=400,
+                             detail="Pick at least one dot point.")
+
+    target_marks = round(duration_minutes / 1.5)
+    qids, diag = pick_question_ids(chosen_dots, paper_type, target_marks, seed=seed)
+    if not qids:
+        raise HTTPException(status_code=400,
+                             detail=diag.get("warning") or "No questions match this combination.")
+
+    paper_label = PAPER_TYPE_LABEL[paper_type]
+    summary = dot_point_labels(chosen_dots)
+    if diag.get("warning"):
+        summary = f"{summary} — {diag['warning']}"
+
+    title = "VCE Mathematical Methods — practice paper"
+    achieved = diag.get("achieved_marks", target_marks)
+    subtitle = f"{diag['n_units']} questions · {achieved} marks · {paper_label.lower()}"
+
+    pdf_bytes = generate_pdf(
+        qids,
+        title=title,
+        subtitle=subtitle,
+        filters_summary=summary,
+        paper_type_label=paper_label,
+        duration_minutes=duration_minutes,
+    )
+
+    fname = f"vce_methods_{paper_type}_{duration_minutes}min.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# ───── admin routes (registered only when ADMIN=1) ──────────────────
+# Public deploys (Fly.io) leave ADMIN unset, so the entire authoring tool is
+# absent from the public URL. Local dev runs `ADMIN=1 uvicorn app.main:app`.
+
+def _admin_guard():
+    if not ADMIN_ENABLED:
+        raise HTTPException(status_code=404)
 
 
 @app.get("/admin/sources", response_class=HTMLResponse)
 def admin_sources(request: Request) -> HTMLResponse:
+    _admin_guard()
     with _db() as conn:
         sources = conn.execute(
             """
@@ -199,8 +303,7 @@ def admin_sources(request: Request) -> HTMLResponse:
             """
         ).fetchall()
     return templates.TemplateResponse(
-        "admin_sources.html",
-        {"request": request, "sources": sources},
+        request, "admin_sources.html", {"sources": sources},
     )
 
 
@@ -213,6 +316,7 @@ def admin_questions(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ) -> HTMLResponse:
+    _admin_guard()
     where = ["1=1"]
     params: list = []
     if year is not None:
@@ -246,9 +350,9 @@ def admin_questions(
         ).fetchall()
 
     return templates.TemplateResponse(
+        request,
         "admin_questions.html",
         {
-            "request": request,
             "questions": rows,
             "total": total,
             "page": page,
@@ -260,6 +364,7 @@ def admin_questions(
 
 @app.get("/admin/question/{qid}", response_class=HTMLResponse)
 def admin_question(request: Request, qid: str) -> HTMLResponse:
+    _admin_guard()
     with _db() as conn:
         q = conn.execute(
             """
@@ -307,9 +412,9 @@ def admin_question(request: Request, qid: str) -> HTMLResponse:
         next_qid = sibling_ids[idx + 1] if 0 <= idx < len(sibling_ids) - 1 else None
 
     return templates.TemplateResponse(
+        request,
         "admin_question.html",
         {
-            "request": request,
             "q": q,
             "tags": tags,
             "answer": answer,
@@ -324,6 +429,7 @@ def admin_question(request: Request, qid: str) -> HTMLResponse:
 
 @app.get("/admin/review", response_class=HTMLResponse)
 def admin_review(request: Request) -> HTMLResponse:
+    _admin_guard()
     with _db() as conn:
         rows = conn.execute(
             """
@@ -335,12 +441,13 @@ def admin_review(request: Request) -> HTMLResponse:
             """
         ).fetchall()
     return templates.TemplateResponse(
-        "admin_review.html", {"request": request, "items": rows}
+        request, "admin_review.html", {"items": rows},
     )
 
 
 @app.get("/source/{sid}/page/{p}.png")
 def source_page_png(sid: int, p: int, dpi: int = Query(150, ge=72, le=300)) -> Response:
+    _admin_guard()
     with _db() as conn:
         row = conn.execute("select pdf_path from sources where id = ?", (sid,)).fetchone()
     if row is None:
@@ -382,6 +489,96 @@ def answer_image(filename: str) -> Response:
     return FileResponse(target)
 
 
+@app.get("/mc-row-thumbs/{filename}")
+def mc_row_thumb(filename: str) -> Response:
+    _admin_guard()
+    from pipeline.extract_answers import MC_ROW_THUMBS_DIR
+    target = (MC_ROW_THUMBS_DIR / filename).resolve()
+    if not str(target).startswith(str(MC_ROW_THUMBS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="bad path")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="thumbnail not found")
+    return FileResponse(target)
+
+
+# ───── manual MC-answer verification ─────────────────────────────────
+
+
+@app.get("/admin/mc-answers/{sid}", response_class=HTMLResponse)
+def admin_mc_answers(sid: int, request: Request) -> HTMLResponse:
+    """Chip-based audit: each Section A MC shows the % distribution, the current
+    `mc_correct` highlighted, and a thumbnail of the row from the examiner-report
+    PDF so the user can verify the shaded cell by eye.
+    """
+    _admin_guard()
+    from pipeline.extract_answers import crop_mc_answer_table_rows
+    with _db() as conn:
+        source = conn.execute(
+            "select id, year, paper, report_path from sources where id = ?", (sid,),
+        ).fetchone()
+        if source is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        if source["paper"] != 2:
+            raise HTTPException(status_code=400, detail="only Paper 2 has MCs")
+        rows = conn.execute(
+            """
+            select q.id, q.question_number, q.mc_correct,
+                   (select final_answer_md from answers a where a.question_id = q.id) as fam
+            from questions q where q.source_id = ? and q.section = 'A'
+            order by q.question_number
+            """,
+            (sid,),
+        ).fetchall()
+
+    thumbs = crop_mc_answer_table_rows(REPO_ROOT / source["report_path"], sid)
+
+    items = []
+    for r in rows:
+        dist = []
+        try:
+            fam = json.loads(r["fam"]) if r["fam"] else {}
+            for d in (fam.get("distribution") or []):
+                dist.append({"letter": d.get("letter"), "pct": d.get("pct")})
+        except Exception:
+            pass
+        items.append({
+            "qid": r["id"],
+            "qn": r["question_number"],
+            "current": r["mc_correct"],
+            "distribution": dist,
+            "thumb_filename": Path(thumbs[r["question_number"]]).name if r["question_number"] in thumbs else None,
+        })
+
+    return templates.TemplateResponse(
+        request, "admin_mc_answers.html",
+        {"source": dict(source), "items": items},
+    )
+
+
+@app.post("/admin/mc-answers/save")
+def admin_mc_answers_save(payload: dict) -> dict:
+    _admin_guard()
+    qid = payload.get("question_id")
+    letter = (payload.get("letter") or "").strip().upper()
+    if not qid or letter not in {"A", "B", "C", "D", "E"}:
+        raise HTTPException(status_code=400, detail="need question_id + letter A-E")
+    with _db() as conn:
+        # Update questions.mc_correct
+        conn.execute("update questions set mc_correct = ? where id = ?", (letter, qid))
+        # Update final_answer_md.correct in the answers row, preserving distribution.
+        row = conn.execute("select final_answer_md from answers where question_id = ?", (qid,)).fetchone()
+        if row and row["final_answer_md"]:
+            try:
+                blob = json.loads(row["final_answer_md"])
+                blob["correct"] = letter
+                conn.execute("update answers set final_answer_md = ? where question_id = ?",
+                             (json.dumps(blob), qid))
+            except json.JSONDecodeError:
+                pass
+        conn.commit()
+    return {"question_id": qid, "letter": letter, "ok": True}
+
+
 # ───── manual diagram annotation ─────────────────────────────────────
 
 
@@ -392,6 +589,7 @@ def admin_diagrams_list(sid: int, request: Request) -> HTMLResponse:
        - Done: has a manual bbox stored
        - Audit warnings: pages with many drawings but no flagged question
     """
+    _admin_guard()
     from pipeline.extract_diagrams import find_audit_pages
     with _db() as conn:
         source = conn.execute(
@@ -440,9 +638,9 @@ def admin_diagrams_list(sid: int, request: Request) -> HTMLResponse:
                 (done if row["is_manual"] else to_draw).append(row)
     audit = find_audit_pages(sid)
     return templates.TemplateResponse(
+        request,
         "admin_diagrams.html",
         {
-            "request": request,
             "source": dict(source),
             "to_draw": to_draw,
             "done": done,
@@ -457,6 +655,7 @@ def admin_diagram_edit(sid: int, qid: str, request: Request,
     """Single-question annotation editor. Renders the source page and a draw canvas.
     If `page` is omitted, defaults to the question's source_page_start.
     """
+    _admin_guard()
     with _db() as conn:
         q = conn.execute(
             """
@@ -507,9 +706,9 @@ def admin_diagram_edit(sid: int, qid: str, request: Request,
         b = sb["bbox_pdf"]
         existing_bbox = [b[0] / pw, b[1] / ph, b[2] / pw, b[3] / ph]
     return templates.TemplateResponse(
+        request,
         "admin_diagram_edit.html",
         {
-            "request": request,
             "q": dict(q),
             "source_id": sid,
             "target_page": target_page,
@@ -525,6 +724,7 @@ def admin_diagram_edit(sid: int, qid: str, request: Request,
 def admin_diagrams_save(payload: dict) -> dict:
     """Body: {question_id, page, bbox_normalised: [x0,y0,x1,y1]}.
     Crops the source page and updates the DB. Idempotent."""
+    _admin_guard()
     from pipeline.extract_diagrams import crop_from_manual_bbox
     qid = payload.get("question_id")
     page = payload.get("page")
@@ -540,6 +740,7 @@ def admin_diagrams_save(payload: dict) -> dict:
 def admin_diagram_option_edit(sid: int, qid: str, label: str, request: Request,
                               page: Optional[int] = Query(None)) -> HTMLResponse:
     """Editor for one MC option panel (A/B/C/D/E)."""
+    _admin_guard()
     label = label.upper()
     if label not in {"A", "B", "C", "D", "E"}:
         raise HTTPException(status_code=400, detail="option label must be A-E")
@@ -579,9 +780,9 @@ def admin_diagram_option_edit(sid: int, qid: str, label: str, request: Request,
     next_label = diagram_labels[li + 1] if 0 <= li < len(diagram_labels) - 1 else None
 
     return templates.TemplateResponse(
+        request,
         "admin_diagram_edit.html",
         {
-            "request": request,
             "q": dict(q),
             "source_id": sid,
             "target_page": target_page,
@@ -600,6 +801,7 @@ def admin_diagram_option_edit(sid: int, qid: str, label: str, request: Request,
 @app.post("/admin/diagrams/save_option")
 def admin_diagrams_save_option(payload: dict) -> dict:
     """Body: {question_id, option_label, page, bbox_normalised}."""
+    _admin_guard()
     from pipeline.extract_diagrams import crop_option_from_manual_bbox
     qid = payload.get("question_id")
     label = payload.get("option_label")
@@ -615,6 +817,7 @@ def admin_diagrams_save_option(payload: dict) -> dict:
 @app.post("/admin/diagrams/dismiss")
 def admin_diagrams_dismiss(payload: dict) -> dict:
     """Mark a question as having no diagram (false-positive correction)."""
+    _admin_guard()
     qid = payload.get("question_id")
     if not qid:
         raise HTTPException(status_code=400, detail="need question_id")
@@ -631,6 +834,7 @@ def admin_diagrams_dismiss(payload: dict) -> dict:
 def admin_diagrams_flag(payload: dict) -> dict:
     """Mark a question as having a diagram. Used from audit-warning rows to escalate
     a question from the warning bucket into the 'to draw' bucket."""
+    _admin_guard()
     qid = payload.get("question_id")
     if not qid:
         raise HTTPException(status_code=400, detail="need question_id")

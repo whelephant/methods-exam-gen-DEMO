@@ -1,0 +1,33 @@
+# VCE Hub — Fly.io app config.
+#
+# Deploy steps (one-time):
+#   brew install flyctl
+#   fly auth login
+#   fly launch --no-deploy --copy-config    # creates the app, keeps this fly.toml
+#   fly deploy
+#   fly open
+#
+# Custom domain (later):
+#   fly certs create yourdomain.com
+#   then add a CNAME record at your registrar pointing to <app>.fly.dev
+
+app = "vce-hub"             # rename via `fly apps rename` after first launch
+primary_region = "syd"      # closest to Melbourne — lowest TTFB for AU users
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep one machine warm — cold starts add 15-20s for image pull + Chromium spawn,
+  # which feels broken to anyone clicking the shared link. ~$2/mo for always-on.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  # Chromium needs headroom — 512MB OOMs on multi-page papers under load.
+  memory = "1024mb"
+  cpu_kind = "shared"
+  cpus = 1

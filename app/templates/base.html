@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Methods Exam Gen{% endblock %}</title>
+  <title>{% block title %}VCE Hub{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
@@ -17,14 +17,17 @@
             ],
             throwOnError: false
           });"></script>
+  {% block extra_head %}{% endblock %}
 </head>
 <body>
   <header>
     <nav>
-      <a href="/" class="brand">Methods Exam Gen</a>
-      <a href="/admin/sources">sources</a>
-      <a href="/admin/questions">questions</a>
-      <a href="/admin/review">review</a>
+      <a href="/" class="brand">VCE Hub</a>
+      {% if admin_enabled %}
+        <a href="/admin/sources">sources</a>
+        <a href="/admin/questions">questions</a>
+        <a href="/admin/review">review</a>
+      {% endif %}
     </nav>
   </header>
   <main>

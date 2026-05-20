@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}MC audit · {{ source.year }} P{{ source.paper }}{% endblock %}
+{% block content %}
+<style>
+  .mc-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; margin-top: 4mm; }
+  .mc-table th, .mc-table td { padding: 2mm 3mm; border-bottom: 1px solid #eee; vertical-align: middle; }
+  .mc-table thead th { background: #fafafa; color: #555; font-weight: 600; text-align: left; }
+  .qn { font-weight: 600; font-size: 1.05rem; color: #336699; width: 36px; text-align: right; padding-right: 8mm; }
+  .row-thumb { max-width: 520px; max-height: 60px; border: 1px solid #ddd; background: #fff; display: block; }
+  .chips { display: flex; gap: 4px; }
+  .chip { display: inline-flex; flex-direction: column; align-items: center; min-width: 56px;
+          padding: 3px 6px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer;
+          background: #fff; font-size: 0.92rem; user-select: none; transition: all 0.1s; }
+  .chip .letter { font-weight: 600; }
+  .chip .pct { color: #888; font-size: 0.78rem; line-height: 1.1; }
+  .chip:hover { border-color: #336699; background: #eef3f8; }
+  .chip.current { background: #336699; color: #fff; border-color: #1f4063; }
+  .chip.current .pct { color: rgba(255,255,255,0.8); }
+  .chip.saved-flash { background: #2e7d32; color: #fff; border-color: #1b5e20; }
+  .chip.saved-flash .pct { color: rgba(255,255,255,0.85); }
+  .summary { color: #666; font-size: 0.92rem; margin: 4mm 0; }
+</style>
+
+<h1>MC answer audit — {{ source.year }} Paper {{ source.paper }}</h1>
+<p class="summary">
+  Click the correct letter for each MC. The right column shows the row cropped from the
+  examiner-report PDF — the shaded cell is the correct answer. Saves are instant.
+</p>
+
+<table class="mc-table">
+  <thead>
+    <tr>
+      <th style="width: 40px">Q</th>
+      <th style="width: 480px">Options (click to set correct)</th>
+      <th>Examiner-report row (shading = correct)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for it in items %}
+      <tr>
+        <td class="qn">{{ it.qn }}</td>
+        <td>
+          <div class="chips" data-qid="{{ it.qid }}">
+            {% for d in it.distribution %}
+              {% if d.letter and d.letter != 'N/A' %}
+                <button class="chip{% if d.letter == it.current %} current{% endif %}"
+                        data-letter="{{ d.letter }}">
+                  <span class="letter">{{ d.letter }}</span>
+                  <span class="pct">{{ d.pct }}%</span>
+                </button>
+              {% endif %}
+            {% endfor %}
+            {% if not it.distribution %}
+              {% for L in ['A','B','C','D','E'] %}
+                <button class="chip{% if L == it.current %} current{% endif %}" data-letter="{{ L }}">
+                  <span class="letter">{{ L }}</span>
+                </button>
+              {% endfor %}
+            {% endif %}
+          </div>
+        </td>
+        <td>
+          {% if it.thumb_filename %}
+            <img class="row-thumb" src="/mc-row-thumbs/{{ it.thumb_filename }}" alt="Q{{ it.qn }} row">
+          {% else %}
+            <span style="color:#999">(no thumbnail)</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<script>
+document.querySelectorAll('.chips').forEach(group => {
+  const qid = group.dataset.qid;
+  group.querySelectorAll('.chip').forEach(chip => {
+    chip.addEventListener('click', async () => {
+      const letter = chip.dataset.letter;
+      // Optimistic UI
+      group.querySelectorAll('.chip').forEach(c => c.classList.remove('current'));
+      chip.classList.add('current', 'saved-flash');
+      const r = await fetch('/admin/mc-answers/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({question_id: qid, letter}),
+      });
+      if (!r.ok) {
+        alert('save failed: ' + await r.text());
+        return;
+      }
+      setTimeout(() => chip.classList.remove('saved-flash'), 350);
+    });
+  });
+});
+</script>
+{% endblock %}

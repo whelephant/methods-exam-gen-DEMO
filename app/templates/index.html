@@ -1,28 +1,196 @@
 {% extends "base.html" %}
-{% block title %}Methods Exam Gen{% endblock %}
+{% block title %}VCE Methods practice papers{% endblock %}
+{% block extra_head %}
+<style>
+  .gen-form { max-width: 940px; }
+  .gen-form .lede { color: var(--muted); font-size: 1rem; margin-bottom: 2rem; }
+
+  .gen-form fieldset {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem 1.25rem;
+    margin: 0 0 1.25rem 0;
+    background: var(--card);
+  }
+  .gen-form legend {
+    font-weight: 600;
+    color: var(--accent);
+    padding: 0 0.5rem;
+    font-size: 0.95rem;
+  }
+  .gen-form .helper {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin: 0 0 0.75rem 0;
+  }
+
+  /* AoS group containers */
+  .aos-group { margin-bottom: 1rem; }
+  .aos-group:last-child { margin-bottom: 0; }
+  .aos-group summary {
+    font-weight: 600;
+    padding: 0.5rem 0.75rem;
+    background: var(--accent-light);
+    color: var(--accent);
+    border-radius: 4px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  .aos-group summary::-webkit-details-marker { display: none; }
+  .aos-group summary::before {
+    content: "▶ ";
+    font-size: 0.7em;
+    margin-right: 0.4em;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+  .aos-group[open] summary::before { transform: rotate(90deg); }
+  .aos-group summary .aos-meta {
+    float: right;
+    font-weight: 400;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+
+  .dot-list {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.25rem;
+    padding: 0.75rem 0.5rem 0.25rem;
+  }
+  .dot-list label {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 0.4rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.92rem;
+    line-height: 1.4;
+    cursor: pointer;
+  }
+  .dot-list label:hover { background: #f3f6fa; }
+  .dot-list input[type="checkbox"] { margin-top: 0.2rem; flex-shrink: 0; }
+  .dot-list .dot-id {
+    color: var(--accent);
+    font-weight: 600;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    margin-right: 0.25rem;
+    flex-shrink: 0;
+  }
+
+  /* Inline radio + number rows */
+  .radio-row { display: flex; gap: 1.25rem; flex-wrap: wrap; }
+  .radio-row label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+    padding: 0.4rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #fff;
+    font-size: 0.95rem;
+  }
+  .radio-row label:has(input:checked) {
+    border-color: var(--accent);
+    background: var(--accent-light);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .duration-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+  .duration-row input[type="number"] {
+    padding: 0.45rem 0.6rem;
+    font-size: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 7rem;
+  }
+  .duration-row .unit { color: var(--muted); }
+
+  .gen-form .submit-row {
+    margin-top: 1.5rem;
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+  }
+  .gen-form button[type="submit"] {
+    padding: 0.7rem 1.5rem;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .gen-form button[type="submit"]:hover { background: #002a55; }
+  .gen-form .submit-hint { color: var(--muted); font-size: 0.85rem; }
+
+  .corpus-footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+</style>
+{% endblock %}
 {% block content %}
-<h1>Methods Exam Gen</h1>
-<p class="lede">Practice papers assembled from real VCAA past questions.</p>
+<div class="gen-form">
+  <h1>VCE Methods practice papers</h1>
+  <p class="lede">Pick the dot points you want to practice, choose a paper type and duration. The generator assembles real past VCAA questions into a printable PDF.</p>
 
-<section class="stats">
-  <div class="stat"><span class="n">{{ stats.sources }}</span><span class="l">sources</span></div>
-  <div class="stat"><span class="n">{{ stats.questions }}</span><span class="l">questions extracted</span></div>
-  <div class="stat"><span class="n">{{ stats.tagged }}</span><span class="l">tagged</span></div>
-  <div class="stat"><span class="n">{{ stats.answered }}</span><span class="l">with answers</span></div>
-  <div class="stat"><span class="n">{{ stats.review }}</span><span class="l">needs review</span></div>
-  <div class="stat"><span class="n">${{ "%.4f"|format(stats.spend_usd) }}</span><span class="l">API spend</span></div>
-</section>
+  <form method="post" action="/generate.pdf">
+    <fieldset>
+      <legend>1 · Topics</legend>
+      <p class="helper">Tick any combination of dot points across areas. Picking a dot point also pulls in <em>earlier</em> dot points within the same Area of Study (the course is taught sequentially).</p>
+      {% for area in areas %}
+        <details class="aos-group" {% if loop.first %}open{% endif %}>
+          <summary>
+            AoS {{ area.aos }} — {{ area.title }}
+            <span class="aos-meta">{{ area.points | length }} dot point{{ '' if (area.points | length) == 1 else 's' }}</span>
+          </summary>
+          <div class="dot-list">
+            {% for p in area.points %}
+              <label>
+                <input type="checkbox" name="dot" value="{{ area.aos }}.{{ p.sort_order }}">
+                <span class="dot-id">{{ area.aos }}.{{ p.sort_order }}</span>
+                <span>{{ p.text }}</span>
+              </label>
+            {% endfor %}
+          </div>
+        </details>
+      {% endfor %}
+    </fieldset>
 
-<section>
-  <h2>What to do next</h2>
-  <p>
-    The selection / generation UI lands in stage&nbsp;D once the question database is trustworthy.
-    For now, use the admin views to audit extraction progress:
-  </p>
-  <ul>
-    <li><a href="/admin/sources">Sources</a> — every (year, paper) PDF and whether its examiner report is matched.</li>
-    <li><a href="/admin/questions">Questions</a> — every extracted question (empty until stage&nbsp;B runs).</li>
-    <li><a href="/admin/review">Review queue</a> — anything the pipeline wasn't confident about.</li>
-  </ul>
-</section>
+    <fieldset>
+      <legend>2 · Paper type</legend>
+      <div class="radio-row">
+        <label><input type="radio" name="paper_type" value="tech_free" checked> Technology-free <small style="color:var(--muted)">(Paper 1)</small></label>
+        <label><input type="radio" name="paper_type" value="mc"> Multiple-choice <small style="color:var(--muted)">(Paper 2 §A)</small></label>
+        <label><input type="radio" name="paper_type" value="tech_active"> Technology-active <small style="color:var(--muted)">(Paper 2 §B)</small></label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>3 · Duration</legend>
+      <div class="duration-row">
+        <input type="number" name="duration_minutes" min="10" max="180" step="5" value="60" required>
+        <span class="unit">minutes</span>
+      </div>
+      <p class="helper" style="margin-top: 0.5rem;">Target marks ≈ duration ÷ 1.5 (60 min → 40 marks). Reading time of 15 minutes is added on the cover.</p>
+    </fieldset>
+
+    <div class="submit-row">
+      <button type="submit">Generate PDF</button>
+      <span class="submit-hint">Generation takes 15–30 seconds.</span>
+    </div>
+  </form>
+
+  <div class="corpus-footer">
+    Corpus: {{ stats.questions }} questions across {{ stats.sources }} past VCAA papers ({{ stats.tagged }} tagged, {{ stats.answered }} with answers).
+  </div>
+</div>
 {% endblock %}

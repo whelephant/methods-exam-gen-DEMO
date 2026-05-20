@@ -263,7 +263,10 @@ def _source_summary(groups: list[QuestionGroup]) -> str:
 
 
 def render_html(groups: list[QuestionGroup], answers: dict[str, dict],
-                *, title: str, subtitle: str, filters_summary: str) -> str:
+                *, title: str, subtitle: str, filters_summary: str,
+                paper_type_label: Optional[str] = None,
+                duration_minutes: Optional[int] = None,
+                reading_minutes: int = 15) -> str:
     env = Environment(
         loader=FileSystemLoader(str(TEMPLATES_DIR)),
         autoescape=select_autoescape(["html"]),
@@ -280,6 +283,9 @@ def render_html(groups: list[QuestionGroup], answers: dict[str, dict],
         title=title,
         subtitle=subtitle,
         filters_summary=filters_summary,
+        paper_type_label=paper_type_label,
+        duration_minutes=duration_minutes,
+        reading_minutes=reading_minutes,
         groups=groups,
         answers=answers,
         total_marks=total_marks,
@@ -298,11 +304,17 @@ def html_to_pdf_bytes(html: str) -> bytes:
             f.write(html.encode("utf-8"))
             html_path = Path(f.name)
         try:
-            page.goto(html_path.as_uri(), wait_until="networkidle")
-            # Best-effort wait for KaTeX auto-render to finish (it's async).
+            # `load` (not networkidle) — networkidle requires 500ms of zero
+            # traffic after the LAST request, which on slow networks waits
+            # forever for KaTeX font subsetting fetches. We have a precise
+            # readiness signal (`window.__katexReady`), so use it directly.
+            page.goto(html_path.as_uri(), wait_until="load")
             try:
-                page.wait_for_function("window.__katexReady === true", timeout=8000)
+                page.wait_for_function("window.__katexReady === true", timeout=10000)
             except Exception:
+                # KaTeX never reported ready (CDN slow / blocked). Render anyway —
+                # math will appear as raw `$...$` source rather than typeset, which
+                # beats hanging the request.
                 pass
             pdf_bytes = page.pdf(
                 format="A4",
@@ -319,7 +331,10 @@ def html_to_pdf_bytes(html: str) -> bytes:
 
 
 def generate_pdf(question_ids: list[str], *, title: str, subtitle: str,
-                 filters_summary: str) -> bytes:
+                 filters_summary: str,
+                 paper_type_label: Optional[str] = None,
+                 duration_minutes: Optional[int] = None,
+                 reading_minutes: int = 15) -> bytes:
     groups = load_groups(question_ids)
     qids_in_groups: list[str] = []
     for g in groups:
@@ -330,5 +345,9 @@ def generate_pdf(question_ids: list[str], *, title: str, subtitle: str,
         qids_in_groups.extend(p["id"] for p in g.parts)
     answers = load_answers(qids_in_groups)
     html = render_html(groups, answers,
-                       title=title, subtitle=subtitle, filters_summary=filters_summary)
+                       title=title, subtitle=subtitle,
+                       filters_summary=filters_summary,
+                       paper_type_label=paper_type_label,
+                       duration_minutes=duration_minutes,
+                       reading_minutes=reading_minutes)
     return html_to_pdf_bytes(html)

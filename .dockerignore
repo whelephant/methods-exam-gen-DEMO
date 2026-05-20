@@ -1,0 +1,43 @@
+# Source PDFs and examiner reports — needed only by the offline ingest pipeline,
+# never read at runtime. Excluding them keeps the production image small (~700MB).
+mathematical_methods/
+
+# Offline ingest pipeline. The runtime only imports pipeline/db.py (copied
+# explicitly in Dockerfile). The rest needs the Anthropic SDK + raw PDFs.
+pipeline/cache/
+pipeline/__pycache__/
+pipeline/extract_*.py
+pipeline/spend.py
+pipeline/tag_questions.py
+
+# Local dev artefacts
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets — never ship to image
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Plans / docs / scratch
+out/
+plans/
+*.md
+!CLAUDE.md
+
+# Build artefacts (won't exist in this repo but cheap insurance)
+node_modules/
+dist/
+build/
