@@ -171,6 +171,7 @@ def load_groups(question_ids: list[str]) -> list[QuestionGroup]:
                 select q.*, s.year, s.paper
                 from questions q join sources s on s.id = q.source_id
                 where q.source_id = ? and q.section is ? and q.question_number = ?
+                  and q.out_of_scope = 0
                 """,
                 (m["source_id"], m["section"], m["question_number"]),
             ).fetchall()
@@ -264,6 +265,7 @@ def _source_summary(groups: list[QuestionGroup]) -> str:
 
 def render_html(groups: list[QuestionGroup], answers: dict[str, dict],
                 *, title: str, subtitle: str, filters_summary: str,
+                subject_display_name: str = "Mathematical Methods",
                 paper_type_label: Optional[str] = None,
                 duration_minutes: Optional[int] = None,
                 reading_minutes: int = 15) -> str:
@@ -283,6 +285,7 @@ def render_html(groups: list[QuestionGroup], answers: dict[str, dict],
         title=title,
         subtitle=subtitle,
         filters_summary=filters_summary,
+        subject_display_name=subject_display_name,
         paper_type_label=paper_type_label,
         duration_minutes=duration_minutes,
         reading_minutes=reading_minutes,
@@ -332,6 +335,7 @@ def html_to_pdf_bytes(html: str) -> bytes:
 
 def generate_pdf(question_ids: list[str], *, title: str, subtitle: str,
                  filters_summary: str,
+                 subject_display_name: str = "Mathematical Methods",
                  paper_type_label: Optional[str] = None,
                  duration_minutes: Optional[int] = None,
                  reading_minutes: int = 15) -> bytes:
@@ -347,6 +351,7 @@ def generate_pdf(question_ids: list[str], *, title: str, subtitle: str,
     html = render_html(groups, answers,
                        title=title, subtitle=subtitle,
                        filters_summary=filters_summary,
+                       subject_display_name=subject_display_name,
                        paper_type_label=paper_type_label,
                        duration_minutes=duration_minutes,
                        reading_minutes=reading_minutes)

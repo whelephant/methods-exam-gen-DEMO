@@ -169,3 +169,67 @@ Durable lessons accumulated during Stage B. Read these before adding extraction 
 - **Markdown rendering uses markdown-it-py with math sentinels.** `app/render._render_md` stashes `$..$` / `$$..$$` / `\(..\)` / `\[..\]` regions behind `@@MATHn@@` placeholders before running markdown-it (which would otherwise interpret `_` inside math as italics, and strip `\_` escapes). After HTML rendering, the placeholders are swapped back so KaTeX can pick them up in the browser. **Don't use `\x00` as the sentinel** — CommonMark spec replaces null bytes with U+FFFD, which breaks the round-trip.
 
 - **Section-aware delete-before-insert in `pipeline/extract_questions.insert_questions`.** Only deletes rows in the sections present in the fragment batch, so re-extracting just Section A pages doesn't wipe Section B. Sections are tracked via `_section` on each fragment (set during stitching from the model's `section` field).
+
+## Multi-subject support (Specialist Mathematics)
+
+The repo now ingests **both** VCE Mathematical Methods AND VCE Specialist Mathematics (Units 3 & 4) under the "VCE Hub" brand, sharing one SQLite database. The `SUBJECTS` registry in `pipeline/db.py` is the source of truth for per-subject metadata: display name, exam-papers dir, examiner-reports dir, PDF filename glob, `id_prefix` for questions.id, running-header pattern (e.g. `MATHMETH EXAM` vs `SPECMATH EXAM`), and formula-sheet heading text.
+
+- **Schema**: `subject` column on `study_areas`, `study_points`, `question_tags` (migration 001), `sources` + `questions` (migration 005). All queries that filter by `(year, paper)` must also filter by `subject`.
+- **Question ID prefix**: Methods IDs stay unprefixed for legacy continuity (`2023-p1-q3-a`); Specialist IDs prepend `sp-` (`sp-2023-p1-q3-a`). Without the prefix the text-PK `questions.id` would collide.
+- **Cache layout**: `pipeline/cache/<subject>/<year>_p<paper>_page<NNN>.json`. A fallback read for Methods checks the legacy flat layout (`pipeline/cache/<year>_p<paper>_page<NNN>.json`) so pre-multi-subject cache files stay valid byte-for-byte (their `_prompt_hash` still matches because the rendered Methods prompt is byte-identical to the pre-refactor `SYSTEM_PROMPT`).
+- **CLI**: every pipeline module accepts `--subject` (defaults to `mathematical_methods` for backwards compat). E.g. `python -m pipeline.extract_questions --subject specialist_mathematics --year 2023 --paper 1`.
+- **Page-width quirk (matters for diagram cropping)**: Methods 2019+ question pages use a custom 623.62pt-wide page; **everything else** (all Specialist 2016–2025, Methods 2016–2018, and the formula-sheet pages on every modern Methods paper) is standard A4 at 595.28pt. Sidebar constants dispatch on `page.rect.width` via `_sidebar_x_for()` in `pipeline/extract_diagrams.py` — `(50, 580)` for ~623pt, `(50, 568)` for ~595pt. Not subject-based; width-based.
+
+### Specialist Study Design taxonomy
+
+Source: VCAA "VCE Mathematics Study Design 2023" (Updated v1.1), pages 111–117 (Units 3 & 4: Specialist Mathematics section). Seeded by `migrations/006_specialist_study_design.sql`. Six AoSes, 58 tagable dot points + 13 sub-headings.
+
+The original `specialist_mathematics/study_design/aos_dot_points_units_3_4.sql` provided in the repo had unrenderable LaTeX bugs (truncated bullets, `$a 0$` instead of `$a > 0$`, unbalanced parens). **Do not use it.** Migration 006 was regenerated via Claude Sonnet 4.6 vision OCR of the rendered PDF, with every `$...$` block KaTeX-validated for balanced braces and parens before being committed.
+
+### Pre-2023 Study Design change and the scope-triage workflow
+
+VCAA revised the Specialist Mathematics Study Design between 2022 and 2023. Pre-2023 Specialist papers test topics that are no longer in scope under the 2023+ design — confirmed:
+
+- **Mechanics**: Newton's laws (F = ma applied to derive acceleration from forces), forces on inclined planes, free-body diagrams, friction coefficients, tension in strings, equilibrium of forces, weight as a gravitational-force calculation, normal reaction forces, mass-on-pulley systems
+- **Statics**: rigid-body equilibrium, moments of force / torque, centre of mass calculations
+
+These are NOT in the 2023+ catalogue and won't ever match a dot point cleanly. **The tagger reliably force-fits them** — confirmed on Specialist 2022 P1 Q5 (body on smooth inclined plane requiring Newton's second law) which the tagger mapped to AoS 4 dot 23 ("rectilinear motion via differential equations") at confidence 0.85–0.90. The model can't tell that the surface description ("body moves in a straight line, find the speed after 2 seconds") looks compatible with the in-scope dot point while the actual mathematical operation (Newton's laws on an inclined plane) is out of scope.
+
+**Mitigation**: manual scope triage via an admin UI. The user (curriculum expert) flags out-of-scope questions per source paper after extraction completes; the pipeline does NOT attempt to auto-detect.
+
+- Schema: `questions.out_of_scope` (boolean, default 0) added by `migrations/007_questions_out_of_scope.sql`
+- Helper: `mark_out_of_scope(question_id, source_id, reason)` in `pipeline/tag_questions.py` sets the flag, deletes any existing tags, and writes a `review_queue` row with reason `out_of_scope_under_current_design`
+- Filter: `/generate.pdf` always filters `q.out_of_scope = 0`; out-of-scope leaves never appear in generated practice papers regardless of how they were flagged
+- Admin UI (TODO at time of writing): `/admin/scope/{sid}` list view per source with "In scope" / "Out of scope" buckets and per-row toggle (mirrors `/admin/diagrams/{sid}` pattern). Per-question toggle on `/admin/question/{qid}` for spot fixes. See `~/.claude/plans/plan-groovy-wombat.md` for the detailed UI plan.
+
+### Specialist ingestion status (as of latest session)
+
+| Year | P1 | P2 | Diagrams annotated | PDF generated | Notes |
+|---|---|---|---|---|---|
+| 2025 | ✓ | ✓ | ✓ | ✓ | $1.24 total. Q3.e answer manually inserted (heading scan miss) |
+| 2024 | ✓ | ✓ | ✓ | ✓ | $1.56 total. Q2/Q3 boundary surgery on P2 page 13 (Argand parts mis-labelled as Q3) |
+| 2023 | ✓ | ✓ | ✓ | ✓ | $1.85 total. Canary paper; baseline for the pipeline |
+| 2022 | ✓ | ✓ | ✓ | ✓ | P1 Q5.a+Q5.b out-of-scope (mechanics); Q3.b redacted. P2 Q19 redacted, Q6.f low confidence tag, Q20+Q5 out-of-scope (mechanics). Both PDFs generated. |
+| 2021 | ✓ | ✓ | ✓ | ✓ | P1: 22q, 22/22 tagged. P2: 53q, 52/53 tagged (1 review). Both scope triaged + diagrams done. PDFs generated. |
+| 2020 | ✓ | ✓ | ✓ | ✓ | P1: 21q, 16/16 tagged. P2: 58q (surgery: Q3 g(x) parts moved from Q4, Q4.d drone q inserted), 49/49 tagged. MC fix: 2020 docx has no "Correct answer" column — added highest-% fallback. Q5.P2 mechanics out-of-scope. PDFs generated. |
+| 2019 | ✓ | ✓ | ✓ | ✓ | P1: 21q, 18/18 tagged. P2: 64q, 54/54 tagged, 20/20 MC. Scope triaged. PDFs generated. |
+| 2018 | ✓ | ✓ | ✓ | ✓ | P1: 18q, 15/15 tagged. P2: 67q, 57/58 tagged (sA-q4 low confidence), Q4.d/e stitching fixed. 20/20 MC. Scope triaged. PDFs generated. |
+| 2017 | ✓ | ✓ | ✓ | ✓ | P1: 16q, 14/14 tagged. P2: 63q, 55/55 tagged (q4-d manually tagged AoS 3 dot 3 — complex locus). 20/20 MC. Scope triaged. PDFs generated. |
+| 2016 | ✓ | ✓ | ✓ | ✓ | P1: 18q, 15/15 tagged (Q1.a OOS statics). P2: 61q, 53/53 tagged. 20/20 MC. Scope triaged. PDFs generated. |
+
+Cumulative Specialist spend: ~$12.42. Cumulative all-subject spend: ~$25.77.
+
+### Durable bugs caught during 2024–2025 ingestion
+
+These have been fixed; documented here so they don't regress:
+
+- **`_MC_TABLE_HEADER_KEYS` required `% E`** — broke 4-option MC parsing for every 2024+ paper. Fixed by removing `% E` from the required keys (`pipeline/extract_answers.py`); the `pct_cols` loop at the call site already iterates A–E and skips missing letters. Retroactively repaired Methods 2024 P2 + 2025 P2 (both went from 0/20 to 20/20 `mc_correct`).
+- **Split MC answer table** — Specialist 2025 P2 docx splits the 20-row MC answer table into TWO separate `<table>` elements (Q1–10, Q11–20), each with its own header row. `_find_section_a_mc_table` → `_find_section_a_mc_tables` (plural) now returns all matching tables; `extract_mc_answers_from_docx` iterates all of them.
+- **Currency `$` in finance MC questions** — Sonnet emitted `$800` literally for currency amounts, producing an odd `$` count that failed the unbalanced-delimiter quality check. Fix is two-part: extraction prompt now explicitly instructs `\$` escaping for currency contexts (e.g. Q19 on Specialist 2023 P2), AND `quality_check` strips both `$$` (display math) and `\$` (escaped currency) before counting.
+- **Q2/Q3 boundary mis-extraction (page-13 continuation)** — on Specialist 2024 P2 page 13 the model labelled the Q2 continuation parts (Argand circle / ray) as Q3 because the page lacked a visible "Question N" header. The stitcher's monotonicity guard only catches **backward** jumps, not forward skips. Fixed via one-off SQL surgery (rename 4 rows from `q3-*` to `q2-*`, insert the missed Q2.e). The pattern may recur on other split-question pages — watch for marks imbalance (Q2 totalling <10 marks, Q3 totalling >10).
+- **Tagger `aos.maximum: 6`** — was previously hardcoded to 4 (Methods has 4 AoSes, Specialist has 6). Fixed in `TAG_TOOL` schema; per-subject validity is now enforced via the catalogue's `valid_keys` in `validate_tags()`.
+- **`check_budget` compared against all-time cumulative spend** — `pipeline/spend.py`'s `check_budget(budget_usd)` was calling `total_spend()` which sums the entire `extraction_log` table. Once cumulative spend exceeds any per-run `--budget` value, every subsequent run fails on the first page. Fixed by adding a `baseline_usd` parameter; each entry-point (`extract_paper`, `extract_paper_diagrams`, `tag_paper`, `tag_one`) captures `total_spend()` at the start of the run and passes it as `baseline_usd`, so the guard only counts spend incurred during the current run.
+- **`load_groups` in `app/render.py` re-includes out-of-scope siblings** — the renderer fetches all sibling rows for a question group (to get the stem + parts together), but the original query had no `out_of_scope` filter. Result: a redacted/out-of-scope part (e.g. Q3.b) correctly excluded from `qids` by the generate route would be added back as a sibling. Fixed by adding `and q.out_of_scope = 0` to the siblings query in `load_groups`.
+- **Stitcher collapses MC questions when a redacted question creates a number gap** — the monotonicity invariant ("qnum must not skip past max_seen+1") fired on Section A `mc`-kind fragments when a redacted question was skipped by the model (e.g. Q4 redacted → model returns Q3 then Q5 → stitcher treats 3→5 as a forward skip and collapses Q5–Q20 into Q3). Fix: the forward-skip check is now bypassed for `fragment_kind in ("whole", "mc")` — these are always single-page and cannot be mis-numbered continuation pages; a skip simply means a redacted question left a gap.
+- **Specialist 2020 docx MC table has no "Correct answer" column** — only `% A`–`% E` columns; correct answer is indicated by cell shading (unrecoverable from text). `_MC_TABLE_HEADER_KEYS` required "Correct answer", so the table was silently skipped (0/20 MC correct). Fixed by removing "Correct answer" from the required keys and adding a highest-% fallback in `extract_mc_answers_from_docx` (same logic the PDF path already uses). Low-margin cases (<10pp gap) are flagged to `review_queue`. This format applies to all Specialist docx reports that predate the "Correct answer" column — check each year.
+- **Q3/Q4 stitching error on Specialist 2020 P2** — page 17 (Q3's g(x) continuation parts d, e.i, e.ii) was mis-labelled as Q4 by the model; page 20's Q4.d (drone contact, 3 marks) was mis-labelled as Q5.d and overwritten by Q5 mechanics. Result: Q3 had only 6/10 marks, Q4 had 15 marks with g(x) content, Q4.d was the wrong question. Fixed by SQL surgery: renamed Q4.pre-d/d/e.i/e.ii → Q3.*; manually inserted missing Q4.d. Watch for this pattern on other pre-2023 papers with multi-topic Section B questions spanning page breaks.

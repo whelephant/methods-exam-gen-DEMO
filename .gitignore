@@ -17,12 +17,18 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/*.backup*
+data/*.bak*
 
 # Pipeline caches
 pipeline/cache/
 
 # VCAA source material — not committed; lives locally + in Supabase Storage
 mathematical_methods/
+specialist_mathematics/
+general_mathematics/
+
+# Word temp/lock files
+~$*
 
 # Generated assets (diagram + answer crops) — uploaded to Supabase Storage
 assets/

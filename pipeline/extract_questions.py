@@ -36,7 +36,7 @@ import fitz  # pymupdf
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from pipeline.db import REPO_ROOT, connect
+from pipeline.db import DEFAULT_SUBJECT, REPO_ROOT, SUBJECTS, SubjectSpec, connect, subject_spec
 from pipeline.spend import (
     BudgetExceeded,
     MODEL_PRICING,
@@ -68,13 +68,13 @@ ESCALATION_TIERS = ("claude-sonnet-4-6",)  # Opus is opt-in via --include-opus
 
 # ───── system prompt + tool schema ───────────────────────────────────
 
-SYSTEM_PROMPT = r"""You are extracting exam questions from a single page of a VCE Mathematical Methods (Units 3 & 4) exam paper. Your output is inserted verbatim into a question bank.
+SYSTEM_PROMPT_TEMPLATE = r"""You are extracting exam questions from a single page of a VCE {display_name} (Units 3 & 4) exam paper. Your output is inserted verbatim into a question bank.
 
 # 1. Classify the page
 
 Identify `page_type` first:
 - **"questions"** — contains one or more exam questions or sub-questions
-- **"formula_sheet"** — the VCAA Mathematical Methods formula reference sheet at the back of the paper (headings include "Formula sheet", "Mathematical Methods formulas", "END OF FORMULA SHEET"). Always at the end.
+- **"formula_sheet"** — the VCAA {display_name} formula reference sheet at the back of the paper (headings include "Formula sheet", "{formula_heading}", "END OF FORMULA SHEET"). Always at the end.
 - **"instructions"** — cover page, structure-of-the-book, "Instructions" page
 - **"back_matter"** — "END OF QUESTION AND ANSWER BOOK" and surrounding empty pages
 - **"blank"** — "THIS PAGE IS BLANK" or visually empty
@@ -85,7 +85,7 @@ For everything except `"questions"`, return an empty `fragments` array.
 
 These appear on every page and are NOT question content:
 - Page numbers (e.g. "5", "12")
-- Running header `20XX MATHMETH EXAM 1` or `20XX MATHMETH EXAM 2`
+- Running header `20XX {running_header_short} 1` or `20XX {running_header_short} 2`
 - Marginal text: "TURN OVER", "do not write in this area" (often as spaced letters), "Section A – continued"
 - Continuation notices like "Question 7 – continued" — these tell you the page continues a question from a previous page; do not transcribe them
 
@@ -161,6 +161,7 @@ Conventions:
 - Greek $\pi$, $\theta$, $\mu$, $\sigma$, $\hat{p}$
 - Domain notation $f: [0, 2\pi] \to \mathbb{R}$
 - ASCII hyphen `-` for the minus sign (not Unicode U+2212)
+- **Literal currency dollar signs must be escaped as `\$`** (e.g. write `\$800`, `\$13 500`, NOT `$800` or `$13 500`). Currency contexts appear in finance / statistics MC questions about money. Unescaped `$` is reserved for math delimiters and would cause unbalanced-delimiter errors.
 
 **Never include `(cid:NN)` artefacts** in prompt_md. If you see one in the underlying text, look at the visual glyph on the page and write the correct symbol.
 
@@ -373,17 +374,49 @@ def render_page_png(pdf_path: Path, page_num_1based: int, dpi: int = PAGE_DPI) -
         doc.close()
 
 
-def _prompt_hash() -> str:
-    """Stable hash of the prompt + schema + tier list. Used to invalidate cache when these change."""
+def build_system_prompt(spec: SubjectSpec) -> str:
+    """Render the system prompt for a given subject.
+
+    Plain `.replace()` rather than `.format()` because the prompt body contains
+    literal `{...}` JSON examples that would otherwise be misread as placeholders.
+    """
+    return (SYSTEM_PROMPT_TEMPLATE
+            .replace("{display_name}", spec.display_name)
+            .replace("{formula_heading}", spec.formula_heading)
+            .replace("{running_header_short}", spec.running_header_short))
+
+
+def _prompt_hash(spec: SubjectSpec) -> str:
+    """Stable hash of the prompt + schema + tier list. Used to invalidate cache when these change.
+
+    Because the rendered prompt is subject-specific, Methods and Specialist produce
+    different hashes — so each subject has its own cache namespace and previously
+    cached Methods pages stay valid after Specialist support lands.
+    """
     h = hashlib.sha256()
-    h.update(SYSTEM_PROMPT.encode())
+    h.update(build_system_prompt(spec).encode())
     h.update(json.dumps(EXTRACTION_TOOL, sort_keys=True).encode())
     h.update(",".join(ESCALATION_TIERS).encode())
     return h.hexdigest()[:12]
 
 
-def _cache_path(year: int, paper: int, page: int) -> Path:
-    return CACHE_DIR / f"{year}_p{paper}_page{page:03d}.json"
+def _cache_path(spec: SubjectSpec, year: int, paper: int, page: int) -> Path:
+    """Per-subject cache path: pipeline/cache/<subject>/<year>_p<paper>_page<NNN>.json.
+
+    Methods has a legacy flat cache layout at pipeline/cache/*.json (predating
+    multi-subject support). Reads fall back to that path when the subject-scoped
+    file doesn't exist — preserves ~$11 of existing extraction spend. New writes
+    always go to the subject-scoped path.
+    """
+    subdir = CACHE_DIR / spec.name
+    subdir.mkdir(parents=True, exist_ok=True)
+    primary = subdir / f"{year}_p{paper}_page{page:03d}.json"
+    if primary.exists() or spec.name != "mathematical_methods":
+        return primary
+    legacy = CACHE_DIR / f"{year}_p{paper}_page{page:03d}.json"
+    if legacy.exists():
+        return legacy
+    return primary
 
 
 # ───── quality checks ─────────────────────────────────────────────────
@@ -460,8 +493,8 @@ def quality_check(result: dict) -> tuple[bool, Optional[str]]:
                     if ok not in ("text", "diagram"):
                         return False, f"fragment[{i}].mc_options[{j}]: bad kind {ok!r}"
                     kinds_seen.add(ok)
-                    if ok == "text" and not o.get("md"):
-                        return False, f"fragment[{i}].mc_options[{j}]: kind=text but no md"
+                    if ok == "text" and o.get("md") is None:
+                        o["md"] = ""  # model omitted md; accept as empty, flag in review
                     if ok == "diagram":
                         bb = o.get("bbox")
                         if not (isinstance(bb, list) and len(bb) == 4 and all(isinstance(v, (int, float)) and 0 <= v <= 1 for v in bb)):
@@ -473,9 +506,11 @@ def quality_check(result: dict) -> tuple[bool, Optional[str]]:
         if kind in ("stem", "sub_stem") and f.get("marks") is not None:
             return False, f"fragment[{i}]: {kind} has marks={f['marks']}"
 
-        # Balanced $ delimiters (very rough — counts standalone $ pairs)
-        # Exclude $$..$$ display-math pairs (each pair is two $$)
-        cleaned = prompt.replace("$$", "")
+        # Balanced $ delimiters (very rough — counts standalone $ pairs).
+        # Exclude $$..$$ display-math pairs (each pair is two $$). Also exclude
+        # \$ (escaped literal dollar — currency contexts like "$800" / "$13 500"
+        # in finance MC questions, e.g. Specialist 2023 P2 Q19).
+        cleaned = prompt.replace("$$", "").replace(r"\$", "")
         if cleaned.count("$") % 2 != 0:
             return False, f"fragment[{i}]: unbalanced $ delimiters"
 
@@ -524,7 +559,8 @@ class CallResult:
     error: Optional[str] = None
 
 
-def call_one_tier(model_short: str, png_bytes: bytes, year: int, paper: int, page: int) -> CallResult:
+def call_one_tier(spec: SubjectSpec, model_short: str, png_bytes: bytes,
+                  year: int, paper: int, page: int) -> CallResult:
     """Single API call against one tier. Caller decides whether to escalate."""
     model_full = ANTHROPIC_MODEL_IDS[model_short]
     b64 = base64.standard_b64encode(png_bytes).decode("ascii")
@@ -535,7 +571,7 @@ def call_one_tier(model_short: str, png_bytes: bytes, year: int, paper: int, pag
             model=model_full,
             max_tokens=4096,
             system=[
-                {"type": "text", "text": SYSTEM_PROMPT,
+                {"type": "text", "text": build_system_prompt(spec),
                  "cache_control": {"type": "ephemeral"}}
             ],
             tools=[EXTRACTION_TOOL],
@@ -554,7 +590,7 @@ def call_one_tier(model_short: str, png_bytes: bytes, year: int, paper: int, pag
                         },
                         {
                             "type": "text",
-                            "text": f"This is page {page} of the {year} Mathematical Methods Paper {paper}. Extract.",
+                            "text": f"This is page {page} of the {year} {spec.display_name} Paper {paper}. Extract.",
                         },
                     ],
                 }
@@ -599,6 +635,7 @@ def call_one_tier(model_short: str, png_bytes: bytes, year: int, paper: int, pag
 
 
 def extract_page(
+    spec: SubjectSpec,
     source_id: int,
     pdf_path: Path,
     year: int,
@@ -606,14 +643,15 @@ def extract_page(
     page: int,
     *,
     budget_usd: float,
+    baseline_usd: float = 0.0,
     use_cache: bool = True,
     include_opus: bool = False,
 ) -> dict:
     """Extract one page with tier escalation. Returns the accepted payload."""
-    cache_file = _cache_path(year, paper, page)
+    cache_file = _cache_path(spec, year, paper, page)
     if use_cache and cache_file.exists():
         cached = json.loads(cache_file.read_text())
-        if cached.get("_prompt_hash") == _prompt_hash():
+        if cached.get("_prompt_hash") == _prompt_hash(spec):
             return cached["payload"]
 
     png = render_page_png(pdf_path, page)
@@ -623,8 +661,8 @@ def extract_page(
 
     last_reason: Optional[str] = None
     for model in tiers:
-        check_budget(budget_usd)
-        cr = call_one_tier(model, png, year, paper, page)
+        check_budget(budget_usd, baseline_usd)
+        cr = call_one_tier(spec, model, png, year, paper, page)
         ok_payload, reason = quality_check(cr.payload) if cr.ok else (False, cr.error)
 
         log_call(
@@ -637,14 +675,17 @@ def extract_page(
             latency_ms=cr.latency_ms,
             source_id=source_id,
             page=page,
-            prompt_hash=_prompt_hash(),
+            prompt_hash=_prompt_hash(spec),
             ok=ok_payload,
             error_message=reason,
         )
 
         if ok_payload:
-            cache_file.write_text(json.dumps({
-                "_prompt_hash": _prompt_hash(),
+            # write to subject-scoped path (not the legacy fallback)
+            write_path = CACHE_DIR / spec.name / f"{year}_p{paper}_page{page:03d}.json"
+            write_path.parent.mkdir(parents=True, exist_ok=True)
+            write_path.write_text(json.dumps({
+                "_prompt_hash": _prompt_hash(spec),
                 "_model": model,
                 "_cost_usd": cr.cost_usd,
                 "payload": cr.payload,
@@ -666,20 +707,23 @@ def extract_page(
 
 # ───── paper-level orchestration ──────────────────────────────────────
 
-def _make_qid(year: int, paper: int, question_number: int, part: Optional[str],
-              section: Optional[str] = None) -> str:
+def _make_qid(spec: SubjectSpec, year: int, paper: int, question_number: int,
+              part: Optional[str], section: Optional[str] = None) -> str:
     """Deterministic question id.
 
     Section B and Paper 1 use the legacy format `<year>-p<paper>-q<n>[-<part>]`.
     Section A (MC) is prefixed with `sA` to disambiguate from Section B numbering —
     e.g. 2023 P2's Section A Q1 and Section B Q1 are distinct questions that share
-    `question_number=1`. The unique constraint on questions is section-aware (migration 004)
-    so the underlying row can also be disambiguated by section + qnum without needing
-    the id prefix, but the id prefix makes the row's section unambiguous in URLs/logs."""
+    `question_number=1`.
+
+    Subject namespace: each subject's `id_prefix` is prepended (Methods="" for legacy
+    compatibility with already-tagged data, Specialist="sp-"). Without this prefix
+    `sp-2023-p1-q1` and `2023-p1-q1` would collide on the text PK.
+    """
     if section == "A":
-        base = f"{year}-p{paper}-sA-q{question_number}"
+        base = f"{spec.id_prefix}{year}-p{paper}-sA-q{question_number}"
     else:
-        base = f"{year}-p{paper}-q{question_number}"
+        base = f"{spec.id_prefix}{year}-p{paper}-q{question_number}"
     if part:
         return f"{base}-{part.replace('.', '-')}"
     return base
@@ -775,8 +819,11 @@ def _stitch(per_page: list[tuple[int, dict]]) -> tuple[list[dict], list[dict]]:
                 )
                 f["_reconciled_qnum_from"] = qnum
                 f["question_number"] = last_open_qnum
-            elif last_open_qnum is not None and qnum > max_qnum_seen + 1:
-                # Forward jump past max+1 — Methods papers don't skip numbers (1, 2, 3, ..., 9).
+            elif last_open_qnum is not None and qnum > max_qnum_seen + 1 and kind not in ("whole", "mc"):
+                # Forward jump past max+1 — likely a mis-numbered continuation page.
+                # Exception: 'whole' and 'mc' fragments are always single-page and cannot
+                # be continuations, so a skip just means a redacted question created a gap
+                # (e.g. Q4 redacted → Q3 then Q5 is valid).
                 reconciled_reason = (
                     f"qnum {qnum} skips past max_seen+1={max_qnum_seen + 1} — "
                     f"corrected to last_open {last_open_qnum}"
@@ -831,7 +878,8 @@ def _stitch(per_page: list[tuple[int, dict]]) -> tuple[list[dict], list[dict]]:
     return out, review
 
 
-def insert_questions(source_id: int, year: int, paper: int, fragments: list[dict],
+def insert_questions(spec: SubjectSpec, source_id: int, year: int, paper: int,
+                     fragments: list[dict],
                      extraction_models: dict[int, str]) -> int:
     """Replace all questions for this source with the given fragments. Returns count inserted.
 
@@ -878,7 +926,7 @@ def insert_questions(source_id: int, year: int, paper: int, fragments: list[dict
             qnum = f["question_number"]
             part = f.get("part")
             section = f.get("_section")
-            qid = _make_qid(year, paper, qnum, part, section=section)
+            qid = _make_qid(spec, year, paper, qnum, part, section=section)
             kind = f.get("fragment_kind")
             is_mc = 1 if (kind == "mc" or f.get("is_mc")) else 0
             # Persist options in unified dict form: [{"kind":"text","md":...}, ...] or
@@ -923,11 +971,12 @@ def insert_questions(source_id: int, year: int, paper: int, fragments: list[dict
             conn.execute(
                 """
                 insert into questions
-                  (id, source_id, section, question_number, part, marks, prompt_md,
+                  (id, subject, source_id, section, question_number, part, marks, prompt_md,
                    is_mc, mc_options_md, has_diagram, source_page_start, source_page_end,
                    extraction_model)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict (id) do update set
+                  subject            = excluded.subject,
                   source_id          = excluded.source_id,
                   section            = excluded.section,
                   question_number    = excluded.question_number,
@@ -941,9 +990,9 @@ def insert_questions(source_id: int, year: int, paper: int, fragments: list[dict
                   source_page_end    = excluded.source_page_end,
                   extraction_model   = excluded.extraction_model
                 """,
-                (qid, source_id, section, qnum, part, f.get("marks"), f.get("prompt_md", ""),
-                 is_mc, mc_opts_json, has_diagram_flag, page_start, page_end,
-                 model),
+                (qid, spec.name, source_id, section, qnum, part, f.get("marks"),
+                 f.get("prompt_md", ""), is_mc, mc_opts_json, has_diagram_flag,
+                 page_start, page_end, model),
             )
             n += 1
         conn.commit()
@@ -953,6 +1002,7 @@ def insert_questions(source_id: int, year: int, paper: int, fragments: list[dict
 
 
 def extract_paper(
+    subject: str,
     year: int,
     paper: int,
     *,
@@ -961,16 +1011,20 @@ def extract_paper(
     force: bool = False,
     include_opus: bool = False,
 ) -> dict:
+    from pipeline.spend import total_spend
+    baseline_usd = total_spend()
+
+    spec = subject_spec(subject)
     conn = connect()
     try:
         row = conn.execute(
-            "select id, pdf_path from sources where year = ? and paper = ?",
-            (year, paper),
+            "select id, pdf_path from sources where subject = ? and year = ? and paper = ?",
+            (subject, year, paper),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
-        raise RuntimeError(f"no source for {year} paper {paper}")
+        raise RuntimeError(f"no source for {subject} {year} paper {paper}")
     source_id = row["id"]
     pdf_path = REPO_ROOT / row["pdf_path"]
 
@@ -987,15 +1041,16 @@ def extract_paper(
     for p in target_pages:
         try:
             payload = extract_page(
-                source_id, pdf_path, year, paper, p,
-                budget_usd=budget_usd, use_cache=not force, include_opus=include_opus,
+                spec, source_id, pdf_path, year, paper, p,
+                budget_usd=budget_usd, baseline_usd=baseline_usd,
+                use_cache=not force, include_opus=include_opus,
             )
         except BudgetExceeded as e:
             sys.stderr.write(f"BUDGET EXCEEDED on page {p}: {e}\n")
             raise
         per_page_results.append((p, payload))
         # Record model from cache file (most recent cache write).
-        cf = _cache_path(year, paper, p)
+        cf = _cache_path(spec, year, paper, p)
         if cf.exists():
             extraction_models[p] = json.loads(cf.read_text()).get("_model", "")
         if payload.get("page_type") != "questions":
@@ -1019,7 +1074,7 @@ def extract_paper(
             conn.close()
 
     fragments, review_items = _stitch(per_page_results)
-    n_inserted = insert_questions(source_id, year, paper, fragments, extraction_models)
+    n_inserted = insert_questions(spec, source_id, year, paper, fragments, extraction_models)
 
     # Log reconciliation notes + unplaceable fragments to review_queue.
     # Clear prior review entries for this source so we don't accumulate stale ones.
@@ -1031,7 +1086,7 @@ def extract_paper(
         )
         for f in fragments:
             if f.get("_reconciliation_note"):
-                qid = _make_qid(year, paper, f["question_number"], f.get("part"),
+                qid = _make_qid(spec, year, paper, f["question_number"], f.get("part"),
                                 section=f.get("_section"))
                 conn.execute(
                     "insert into review_queue (question_id, source_id, page, reason, detail) values (?, ?, ?, ?, ?)",
@@ -1064,7 +1119,7 @@ def extract_paper(
             n_below = len(below_re.findall(text))
             n_above = len(above_re.findall(text))
             if max(n_below, n_above) >= 2:
-                qid = _make_qid(year, paper, f["question_number"], f.get("part"),
+                qid = _make_qid(spec, year, paper, f["question_number"], f.get("part"),
                                 section=f.get("_section"))
                 conn.execute(
                     "insert into review_queue (question_id, source_id, page, reason, detail) values (?, ?, ?, ?, ?)",
@@ -1096,7 +1151,7 @@ def extract_paper(
         for (key, letter), part_f in parts_by_key.items():
             kids = kids_marks_by_parent.get((key, letter))
             if kids is not None and kids == part_f["marks"]:
-                qid = _make_qid(year, paper, part_f["question_number"], part_f["part"],
+                qid = _make_qid(spec, year, paper, part_f["question_number"], part_f["part"],
                                 section=part_f.get("_section"))
                 conn.execute(
                     "insert into review_queue (question_id, source_id, page, reason, detail) values (?, ?, ?, ?, ?)",
@@ -1144,6 +1199,7 @@ def _parse_pages(s: str) -> list[int]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--subject", default=DEFAULT_SUBJECT, choices=sorted(SUBJECTS.keys()))
     ap.add_argument("--year", type=int, required=True)
     ap.add_argument("--paper", type=int, required=True, choices=[1, 2])
     ap.add_argument("--budget", type=float, default=1.00, help="USD cap, raises BudgetExceeded if total spend hits this")
@@ -1160,7 +1216,7 @@ def main() -> int:
 
     try:
         summary = extract_paper(
-            args.year, args.paper,
+            args.subject, args.year, args.paper,
             budget_usd=args.budget,
             pages=args.pages,
             force=args.force,

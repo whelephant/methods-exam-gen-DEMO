@@ -39,7 +39,7 @@ import fitz
 from PIL import Image
 from docx import Document
 
-from pipeline.db import REPO_ROOT, connect
+from pipeline.db import DEFAULT_SUBJECT, REPO_ROOT, SUBJECTS, connect, subject_spec
 
 ANSWERS_DIR = REPO_ROOT / "assets" / "answers"
 ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
@@ -296,23 +296,33 @@ def docx_commentary_by_question(docx_path: Path) -> dict[tuple[int, Optional[str
 
 # Header row of the Section A answer-key table in VCAA examiner reports.
 # Tolerant of minor whitespace/casing differences.
-_MC_TABLE_HEADER_KEYS = ("Question", "Correct answer", "% A", "% B", "% C", "% D", "% E")
+# 2016–2023 papers have 5 options (A–E); 2024+ has 4 (A–D). The `% E` column is therefore
+# absent from 2024+ answer-key tables, so it's NOT required for table identification.
+# pct_cols at the call site already iterates A..E and skips letters whose column is missing.
+_MC_TABLE_HEADER_KEYS = ("Question", "% A", "% B", "% C", "% D")
 
 
-def _find_section_a_mc_table(docx_path: Path):
-    """Locate the Section A answer-key table inside the examiner report docx.
+def _find_section_a_mc_tables(docx_path: Path):
+    """Locate every Section A answer-key table fragment in the examiner report docx.
 
-    Returns the python-docx Table object, or None if not found. Identification is by
-    header row content rather than position so it survives layout drift across years.
+    Returns a list of python-docx Table objects (empty if none found). Some reports
+    (e.g. Specialist 2025 P2) split the 20-row Section A table across two tables —
+    Q1–Q10 in one, Q11–Q20 in another, each with its own identical header. Both
+    fragments share the canonical header set, so collecting ALL matching tables
+    captures every row.
+
+    Identification is by header row content (rather than position or count) so
+    the matcher survives layout drift across years and split/unified variants.
     """
     doc = Document(docx_path)
+    out = []
     for t in doc.tables:
         if not t.rows:
             continue
         header = [(c.text or "").strip() for c in t.rows[0].cells]
         if all(any(k.lower() in cell.lower() for cell in header) for k in _MC_TABLE_HEADER_KEYS):
-            return t
-    return None
+            out.append(t)
+    return out
 
 
 def extract_mc_answers_from_docx(source_id: int, docx_path: Path,
@@ -330,78 +340,105 @@ def extract_mc_answers_from_docx(source_id: int, docx_path: Path,
       - answers.answer_image_path = NULL (MC answers don't need a cropped image)
     Returns a list of per-row results.
     """
-    table = _find_section_a_mc_table(docx_path)
-    if table is None:
-        return []
-
-    header = [(c.text or "").strip() for c in table.rows[0].cells]
-    # Map column names → index (tolerant of order drift).
-    col = {h.lower(): i for i, h in enumerate(header)}
-    q_col = col.get("question")
-    correct_col = col.get("correct answer")
-    comments_col = col.get("comments")
-    pct_cols: dict[str, int] = {}
-    for letter in ("A", "B", "C", "D", "E", "N/A"):
-        idx = col.get(f"% {letter.lower()}")
-        if idx is not None:
-            pct_cols[letter] = idx
-    if q_col is None or correct_col is None:
+    tables = _find_section_a_mc_tables(docx_path)
+    if not tables:
         return []
 
     rel_report = str(docx_path.relative_to(REPO_ROOT))
     results: list[dict] = []
     conn = connect()
     try:
-        for row in table.rows[1:]:
-            cells = [(c.text or "").strip() for c in row.cells]
-            try:
-                qn = int(cells[q_col])
-            except ValueError:
+        for table in tables:
+            # Each table fragment carries its own header row, so re-read column
+            # positions per-table (column order is consistent across fragments
+            # in practice, but be defensive).
+            header = [(c.text or "").strip() for c in table.rows[0].cells]
+            col = {h.lower(): i for i, h in enumerate(header)}
+            q_col = col.get("question")
+            correct_col = col.get("correct answer")
+            comments_col = col.get("comments")
+            pct_cols: dict[str, int] = {}
+            for letter in ("A", "B", "C", "D", "E", "N/A"):
+                idx = col.get(f"% {letter.lower()}")
+                if idx is not None:
+                    pct_cols[letter] = idx
+            if q_col is None:
                 continue
-            qid = available_mc_qids.get(qn)
-            if qid is None:
-                results.append({"qn": qn, "status": "no_question_row"})
-                continue
-            correct = cells[correct_col].strip().upper()
-            if correct not in {"A", "B", "C", "D", "E"}:
-                results.append({"qn": qn, "status": f"bad_correct={correct!r}"})
-                continue
-            comments = cells[comments_col].strip() if comments_col is not None else ""
 
-            # Store a structured JSON blob in final_answer_md so the renderer can lay out
-            # the correct answer + % distribution as styled chips rather than markdown
-            # with a "←" arrow (which reads as a typo to students).
-            distribution: list[dict] = []
-            for letter, idx in pct_cols.items():
-                v = cells[idx].strip()
-                if not v:
+            for row in table.rows[1:]:
+                cells = [(c.text or "").strip() for c in row.cells]
+                try:
+                    qn = int(cells[q_col])
+                except ValueError:
                     continue
-                distribution.append({"letter": letter, "pct": v})
-            final_answer_md = json.dumps({
-                "type": "mc_answer",
-                "correct": correct,
-                "distribution": distribution,
-            })
+                qid = available_mc_qids.get(qn)
+                if qid is None:
+                    results.append({"qn": qn, "status": "no_question_row"})
+                    continue
 
-            conn.execute(
-                "update questions set mc_correct = ? where id = ?",
-                (correct, qid),
-            )
-            conn.execute(
-                """
-                insert into answers (question_id, final_answer_md, commentary_md,
-                                     source_report_path, answer_image_path)
-                values (?, ?, ?, ?, NULL)
-                on conflict (question_id) do update set
-                  final_answer_md   = excluded.final_answer_md,
-                  commentary_md     = excluded.commentary_md,
-                  source_report_path = excluded.source_report_path,
-                  answer_image_path = NULL
-                """,
-                (qid, final_answer_md, comments or "(no commentary)", rel_report),
-            )
-            results.append({"qn": qn, "qid": qid, "correct": correct,
-                            "comments_len": len(comments), "status": "ok"})
+                if correct_col is not None:
+                    correct = cells[correct_col].strip().upper()
+                    if correct not in {"A", "B", "C", "D", "E"}:
+                        results.append({"qn": qn, "status": f"bad_correct={correct!r}"})
+                        continue
+                else:
+                    # No explicit "Correct answer" column — derive from highest %.
+                    pct_vals: dict[str, float] = {}
+                    for letter, idx in pct_cols.items():
+                        if letter == "N/A":
+                            continue
+                        v = cells[idx].strip()
+                        try:
+                            pct_vals[letter] = float(v)
+                        except ValueError:
+                            pass
+                    if not pct_vals:
+                        results.append({"qn": qn, "status": "no_pct_data"})
+                        continue
+                    sorted_pcts = sorted(pct_vals.items(), key=lambda x: x[1], reverse=True)
+                    correct = sorted_pcts[0][0]
+                    if len(sorted_pcts) >= 2 and (sorted_pcts[0][1] - sorted_pcts[1][1]) < 10:
+                        conn.execute(
+                            "insert into review_queue (question_id, source_id, page, reason, detail) values (?, ?, ?, ?, ?)",
+                            (qid, source_id, None, "mc_correct_low_margin",
+                             f"Q{qn} top pick is {correct} ({sorted_pcts[0][1]}%) but runner-up is {sorted_pcts[1][0]} ({sorted_pcts[1][1]}%) — verify in {rel_report}."),
+                        )
+                comments = cells[comments_col].strip() if comments_col is not None else ""
+
+                # Store a structured JSON blob in final_answer_md so the renderer can lay out
+                # the correct answer + % distribution as styled chips rather than markdown
+                # with a "←" arrow (which reads as a typo to students).
+                distribution: list[dict] = []
+                for letter, idx in pct_cols.items():
+                    v = cells[idx].strip()
+                    if not v:
+                        continue
+                    distribution.append({"letter": letter, "pct": v})
+                final_answer_md = json.dumps({
+                    "type": "mc_answer",
+                    "correct": correct,
+                    "distribution": distribution,
+                })
+
+                conn.execute(
+                    "update questions set mc_correct = ? where id = ?",
+                    (correct, qid),
+                )
+                conn.execute(
+                    """
+                    insert into answers (question_id, final_answer_md, commentary_md,
+                                         source_report_path, answer_image_path)
+                    values (?, ?, ?, ?, NULL)
+                    on conflict (question_id) do update set
+                      final_answer_md   = excluded.final_answer_md,
+                      commentary_md     = excluded.commentary_md,
+                      source_report_path = excluded.source_report_path,
+                      answer_image_path = NULL
+                    """,
+                    (qid, final_answer_md, comments or "(no commentary)", rel_report),
+                )
+                results.append({"qn": qn, "qid": qid, "correct": correct,
+                                "comments_len": len(comments), "status": "ok"})
         conn.commit()
     finally:
         conn.close()
@@ -729,15 +766,16 @@ def resolve_question_id(source_id: int, question_number: int,
 
 # ─── orchestrator ─────────────────────────────────────────────────────
 
-def extract_paper_answers(year: int, paper: int, *, force: bool = False) -> dict:
+def extract_paper_answers(subject: str, year: int, paper: int, *, force: bool = False) -> dict:
+    subject_spec(subject)  # validate subject early
     conn = connect()
     try:
         src = conn.execute(
-            "select id, report_path from sources where year = ? and paper = ?",
-            (year, paper),
+            "select id, report_path from sources where subject = ? and year = ? and paper = ?",
+            (subject, year, paper),
         ).fetchone()
         if src is None:
-            raise RuntimeError(f"no source for {year} paper {paper}")
+            raise RuntimeError(f"no source for {subject} {year} paper {paper}")
         source_id = src["id"]
         if not src["report_path"]:
             raise RuntimeError(f"no examiner report attached for {year} paper {paper}")
@@ -854,6 +892,7 @@ def extract_paper_answers(year: int, paper: int, *, force: bool = False) -> dict
             mc_results = extract_mc_answers_from_docx(source_id, report_path, available_mc_qids)
 
     return {
+        "subject": subject,
         "year": year,
         "paper": paper,
         "headings_found": len(headings),
@@ -867,12 +906,13 @@ def extract_paper_answers(year: int, paper: int, *, force: bool = False) -> dict
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--subject", default=DEFAULT_SUBJECT, choices=sorted(SUBJECTS.keys()))
     ap.add_argument("--year", type=int, required=True)
     ap.add_argument("--paper", type=int, required=True, choices=[1, 2])
     ap.add_argument("--force", action="store_true",
                     help="re-convert docx→pdf even if cached")
     args = ap.parse_args()
-    print(json.dumps(extract_paper_answers(args.year, args.paper, force=args.force), indent=2))
+    print(json.dumps(extract_paper_answers(args.subject, args.year, args.paper, force=args.force), indent=2))
     return 0
 
 

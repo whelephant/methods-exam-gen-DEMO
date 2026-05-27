@@ -34,10 +34,10 @@ from typing import Any, Optional
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from pipeline.db import REPO_ROOT, connect
+from pipeline.db import DEFAULT_SUBJECT, REPO_ROOT, SUBJECTS, SubjectSpec, connect, subject_spec
 from pipeline.extract_questions import ANTHROPIC_MODEL_IDS, _client
 from pipeline.spend import (
-    BudgetExceeded, MODEL_PRICING, check_budget, estimate_cost, log_call,
+    BudgetExceeded, MODEL_PRICING, check_budget, estimate_cost, log_call, total_spend,
 )
 
 load_dotenv(REPO_ROOT / ".env")
@@ -46,10 +46,10 @@ TAGGING_MODEL = "claude-sonnet-4-6"
 CONFIDENCE_FLOOR = 0.5
 
 
-# ─── build the cached dot-point catalogue ─────────────────────────────
+# ─── build the cached dot-point catalogue (per-subject) ───────────────
 
-def _build_catalogue() -> tuple[str, dict[tuple[int, int], str]]:
-    """Returns (catalogue_md, valid_keys).
+def _build_catalogue(subject: str) -> tuple[str, dict[tuple[int, int], str]]:
+    """Returns (catalogue_md, valid_keys) for the given subject.
 
     catalogue_md is the human-readable list of AoS intros and dot points that goes
     into the cached system-prompt prefix. valid_keys is {(aos, sort_order): text}
@@ -58,11 +58,13 @@ def _build_catalogue() -> tuple[str, dict[tuple[int, int], str]]:
     conn = connect()
     try:
         areas = conn.execute(
-            "select aos, title, intro from study_areas where subject='mathematical_methods' order by aos"
+            "select aos, title, intro from study_areas where subject = ? order by aos",
+            (subject,),
         ).fetchall()
         points = conn.execute(
             "select aos, sort_order, is_header, text from study_points "
-            "where subject='mathematical_methods' order by aos, sort_order"
+            "where subject = ? order by aos, sort_order",
+            (subject,),
         ).fetchall()
     finally:
         conn.close()
@@ -87,11 +89,18 @@ def _build_catalogue() -> tuple[str, dict[tuple[int, int], str]]:
     return "\n".join(lines), valid
 
 
-CATALOGUE_MD, VALID_KEYS = _build_catalogue()
+# Cache catalogues per subject — built lazily on first use (so importing this module
+# doesn't run a DB query for every known subject).
+_CATALOGUE_CACHE: dict[str, tuple[str, dict[tuple[int, int], str]]] = {}
 
 
-SYSTEM_PROMPT = (
-    """You tag a single VCE Mathematical Methods (Units 3 & 4) exam question against the Study Design dot points.
+def get_catalogue(subject: str) -> tuple[str, dict[tuple[int, int], str]]:
+    if subject not in _CATALOGUE_CACHE:
+        _CATALOGUE_CACHE[subject] = _build_catalogue(subject)
+    return _CATALOGUE_CACHE[subject]
+
+
+SYSTEM_PROMPT_PREFIX = """You tag a single VCE {display_name} (Units 3 & 4) exam question against the Study Design dot points.
 
 # Output rules
 
@@ -111,8 +120,11 @@ Provide a one-sentence `rationale` per tag explaining *what aspect of the questi
 # Catalogue
 
 """
-    + CATALOGUE_MD
-)
+
+
+def build_system_prompt(spec: SubjectSpec) -> str:
+    catalogue_md, _ = get_catalogue(spec.name)
+    return SYSTEM_PROMPT_PREFIX.replace("{display_name}", spec.display_name) + catalogue_md
 
 
 TAG_TOOL: dict[str, Any] = {
@@ -129,7 +141,9 @@ TAG_TOOL: dict[str, Any] = {
                     "type": "object",
                     "required": ["aos", "dot_point_sort_order", "is_primary", "confidence", "rationale"],
                     "properties": {
-                        "aos": {"type": "integer", "minimum": 1, "maximum": 4},
+                        # max 6 covers both subjects (Methods has AoS 1–4, Specialist 1–6).
+                        # Per-subject validity is checked at run time via the catalogue's valid_keys.
+                        "aos": {"type": "integer", "minimum": 1, "maximum": 6},
                         "dot_point_sort_order": {"type": "integer", "minimum": 1},
                         "is_primary": {"type": "boolean"},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -144,7 +158,7 @@ TAG_TOOL: dict[str, Any] = {
 
 # ─── validation ───────────────────────────────────────────────────────
 
-def validate_tags(payload: dict) -> tuple[Optional[list[dict]], Optional[str]]:
+def validate_tags(payload: dict, valid_keys: dict[tuple[int, int], str]) -> tuple[Optional[list[dict]], Optional[str]]:
     """Return (cleaned_tags, reason_if_invalid). Cleaned tags pass the CONFIDENCE_FLOOR;
     if fewer than 1 survive, returns ([], None) — caller treats as "no tag, send to review"."""
     tags_raw = payload.get("tags", [])
@@ -166,7 +180,7 @@ def validate_tags(payload: dict) -> tuple[Optional[list[dict]], Optional[str]]:
         except (KeyError, ValueError, TypeError) as e:
             return None, f"tag[{i}] missing/invalid field: {e}"
         key = (aos, sort_order)
-        if key not in VALID_KEYS:
+        if key not in valid_keys:
             return None, f"tag[{i}] references unknown dot point ({aos}, {sort_order})"
         if key in seen:
             return None, f"tag[{i}] duplicates ({aos}, {sort_order})"
@@ -297,7 +311,7 @@ class TagCallResult:
     error: Optional[str] = None
 
 
-def call_tagger(qrow: dict) -> TagCallResult:
+def call_tagger(qrow: dict, spec: SubjectSpec) -> TagCallResult:
     parts: list[str] = [f"Question id: `{qrow['id']}`"]
     if qrow.get("stem_prompt"):
         parts.append(f"\n**Stem** (shared context for this multi-part question):\n\n{qrow['stem_prompt']}")
@@ -330,7 +344,7 @@ def call_tagger(qrow: dict) -> TagCallResult:
             model=ANTHROPIC_MODEL_IDS[TAGGING_MODEL],
             max_tokens=1024,
             system=[
-                {"type": "text", "text": SYSTEM_PROMPT,
+                {"type": "text", "text": build_system_prompt(spec),
                  "cache_control": {"type": "ephemeral"}}
             ],
             tools=[TAG_TOOL],
@@ -369,7 +383,34 @@ def call_tagger(qrow: dict) -> TagCallResult:
 
 # ─── DB writes ────────────────────────────────────────────────────────
 
-def write_tags(question_id: str, tags: list[dict]) -> None:
+def mark_out_of_scope(question_id: str, source_id: int, reason: str) -> None:
+    """Set questions.out_of_scope = 1 for a question and log a review-queue note.
+
+    Out-of-scope questions are PRIMARILY testing a topic dropped from the current
+    Study Design (mechanics, statics). They get no `question_tags` rows and are
+    filtered out of practice paper generation by default.
+
+    Existing tags on the question are deleted (this may overwrite a prior force-fit
+    from before the dropped-topics guidance was added to the tagger prompt).
+    """
+    conn = connect()
+    try:
+        conn.execute("update questions set out_of_scope = 1 where id = ?", (question_id,))
+        conn.execute("delete from question_tags where question_id = ?", (question_id,))
+        # Resolved=0 so the human reviewer can audit; reason includes the model's phrase.
+        conn.execute(
+            """
+            insert into review_queue (question_id, source_id, reason, detail)
+            values (?, ?, 'out_of_scope_under_current_design', ?)
+            """,
+            (question_id, source_id, reason or "(no reason provided)"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def write_tags(question_id: str, subject: str, tags: list[dict]) -> None:
     conn = connect()
     try:
         conn.execute("delete from question_tags where question_id = ?", (question_id,))
@@ -378,9 +419,9 @@ def write_tags(question_id: str, tags: list[dict]) -> None:
                 """
                 insert into question_tags
                   (question_id, subject, aos, dot_point_sort_order, is_primary, confidence, tagged_by)
-                values (?, 'mathematical_methods', ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (question_id, t["aos"], t["dot_point_sort_order"],
+                (question_id, subject, t["aos"], t["dot_point_sort_order"],
                  1 if t["is_primary"] else 0, t["confidence"], TAGGING_MODEL),
             )
         conn.commit()
@@ -402,14 +443,18 @@ def write_review_entry(question_id: str, source_id: int, reason: str, detail: st
 
 # ─── orchestrator ─────────────────────────────────────────────────────
 
-def tag_paper(year: int, paper: int, *, budget_usd: float = 1.00, force: bool = False) -> dict:
+def tag_paper(subject: str, year: int, paper: int, *, budget_usd: float = 1.00, force: bool = False) -> dict:
+    baseline_usd = total_spend()
+    spec = subject_spec(subject)
+    _, valid_keys = get_catalogue(subject)
     conn = connect()
     try:
         src = conn.execute(
-            "select id from sources where year = ? and paper = ?", (year, paper),
+            "select id from sources where subject = ? and year = ? and paper = ?",
+            (subject, year, paper),
         ).fetchone()
         if src is None:
-            raise RuntimeError(f"no source for {year} paper {paper}")
+            raise RuntimeError(f"no source for {subject} {year} paper {paper}")
         source_id = src["id"]
         # Clear stale review entries from prior tagger passes for this source.
         conn.execute(
@@ -433,8 +478,8 @@ def tag_paper(year: int, paper: int, *, budget_usd: float = 1.00, force: bool = 
                 results.append({"qid": q["id"], "status": "skipped_existing", "tags": existing})
                 continue
 
-        check_budget(budget_usd)
-        cr = call_tagger(q)
+        check_budget(budget_usd, baseline_usd)
+        cr = call_tagger(q, spec)
         log_call(
             call_type="tag", model=TAGGING_MODEL,
             input_tokens=cr.input_tokens,
@@ -449,7 +494,7 @@ def tag_paper(year: int, paper: int, *, budget_usd: float = 1.00, force: bool = 
             results.append({"qid": q["id"], "status": "call_failed", "error": cr.error})
             continue
 
-        cleaned, reason = validate_tags(cr.payload)
+        cleaned, reason = validate_tags(cr.payload, valid_keys)
         if cleaned is None:
             write_review_entry(q["id"], source_id, "tag_call_invalid",
                                f"{reason}: {json.dumps(cr.payload)[:300]}")
@@ -464,18 +509,17 @@ def tag_paper(year: int, paper: int, *, budget_usd: float = 1.00, force: bool = 
                             "raw": cr.payload})
             continue
 
-        write_tags(q["id"], cleaned)
+        write_tags(q["id"], subject, cleaned)
         primary = next(t for t in cleaned if t["is_primary"])
         results.append({
             "qid": q["id"], "status": "tagged",
             "n_tags": len(cleaned),
             "primary": f"AoS {primary['aos']} dot {primary['dot_point_sort_order']}",
-            "primary_text": VALID_KEYS[(primary["aos"], primary["dot_point_sort_order"])][:80],
+            "primary_text": valid_keys[(primary["aos"], primary["dot_point_sort_order"])][:80],
         })
 
-    spend = sum(r.get("cost_usd", 0) for r in []) or 0  # logged separately
     return {
-        "year": year, "paper": paper,
+        "subject": subject, "year": year, "paper": paper,
         "taggable": len(questions),
         "tagged": sum(1 for r in results if r["status"] == "tagged"),
         "skipped_existing": sum(1 for r in results if r["status"] == "skipped_existing"),
@@ -485,15 +529,20 @@ def tag_paper(year: int, paper: int, *, budget_usd: float = 1.00, force: bool = 
 
 
 def tag_one(question_id: str, *, budget_usd: float = 0.10, force: bool = False) -> dict:
+    baseline_usd = total_spend()
     conn = connect()
     try:
         row = conn.execute(
-            "select q.*, s.id as src_id from questions q join sources s on s.id=q.source_id where q.id = ?",
+            "select q.*, s.id as src_id, s.subject as src_subject "
+            "from questions q join sources s on s.id=q.source_id where q.id = ?",
             (question_id,),
         ).fetchone()
         if row is None:
             raise RuntimeError(f"question {question_id} not found")
         source_id = row["src_id"]
+        subject = row["src_subject"]
+        spec = subject_spec(subject)
+        _, valid_keys = get_catalogue(subject)
         if not force:
             existing = conn.execute(
                 "select count(*) from question_tags where question_id = ?", (question_id,)
@@ -530,8 +579,8 @@ def tag_one(question_id: str, *, budget_usd: float = 0.10, force: bool = False) 
     q = dict(row)
     q["stem_prompt"] = "\n\n".join(stem_parts) if stem_parts else None
 
-    check_budget(budget_usd)
-    cr = call_tagger(q)
+    check_budget(budget_usd, baseline_usd)
+    cr = call_tagger(q, spec)
     log_call(
         call_type="tag", model=TAGGING_MODEL,
         input_tokens=cr.input_tokens,
@@ -543,7 +592,7 @@ def tag_one(question_id: str, *, budget_usd: float = 0.10, force: bool = False) 
     if not cr.ok:
         write_review_entry(question_id, source_id, "tag_call_failed", cr.error or "")
         return {"qid": question_id, "status": "call_failed", "error": cr.error}
-    cleaned, reason = validate_tags(cr.payload)
+    cleaned, reason = validate_tags(cr.payload, valid_keys)
     if cleaned is None:
         write_review_entry(question_id, source_id, "tag_call_invalid",
                            f"{reason}: {json.dumps(cr.payload)[:300]}")
@@ -552,7 +601,7 @@ def tag_one(question_id: str, *, budget_usd: float = 0.10, force: bool = False) 
         write_review_entry(question_id, source_id, "low_confidence_tag",
                            f"all candidate tags below floor; raw: {json.dumps(cr.payload)[:300]}")
         return {"qid": question_id, "status": "low_confidence", "raw": cr.payload}
-    write_tags(question_id, cleaned)
+    write_tags(question_id, subject, cleaned)
     return {"qid": question_id, "status": "tagged", "tags": cleaned}
 
 
@@ -560,7 +609,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--year", type=int, help="paired with --paper")
-    g.add_argument("--question", type=str, help="single question id, e.g. 2023-p1-q3-a")
+    g.add_argument("--question", type=str, help="single question id, e.g. 2023-p1-q3-a or sp-2023-p1-q3-a")
+    ap.add_argument("--subject", default=DEFAULT_SUBJECT, choices=sorted(SUBJECTS.keys()))
     ap.add_argument("--paper", type=int, choices=[1, 2])
     ap.add_argument("--budget", type=float, default=1.00)
     ap.add_argument("--force", action="store_true",
@@ -569,11 +619,12 @@ def main() -> int:
 
     try:
         if args.question:
+            # subject derived from the question's source row in tag_one
             print(json.dumps(tag_one(args.question, budget_usd=args.budget, force=args.force), indent=2))
         else:
             if args.paper is None:
                 ap.error("--year requires --paper")
-            print(json.dumps(tag_paper(args.year, args.paper, budget_usd=args.budget, force=args.force), indent=2))
+            print(json.dumps(tag_paper(args.subject, args.year, args.paper, budget_usd=args.budget, force=args.force), indent=2))
     except BudgetExceeded as e:
         print(f"BUDGET EXCEEDED: {e}", file=sys.stderr)
         return 2

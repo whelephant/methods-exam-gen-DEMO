@@ -13,6 +13,7 @@
       <th>PDF</th>
       <th>Report</th>
       <th>Questions</th>
+      <th>Tools</th>
     </tr>
   </thead>
   <tbody>
@@ -24,6 +25,11 @@
       <td class="mono">{{ s.pdf_path }}</td>
       <td class="mono">{{ s.report_path or '—' }}</td>
       <td>{{ s.n_questions }}</td>
+      <td>
+        <a href="/admin/diagrams/{{ s.id }}">Diagrams</a>
+        &nbsp;·&nbsp;
+        <a href="/admin/scope/{{ s.id }}">Scope triage</a>
+      </td>
     </tr>
     {% endfor %}
   </tbody>

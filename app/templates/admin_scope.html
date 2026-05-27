@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Scope triage · {{ source.year }} P{{ source.paper }}{% endblock %}
+{% block content %}
+<style>
+  .bucket { margin: 6mm 0; }
+  .bucket h2 { font-size: 1.1rem; margin: 4mm 0 2mm 0; }
+  .bucket-count { color: #888; font-weight: 400; font-size: 0.9rem; }
+  table.scope { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  table.scope th, table.scope td { padding: 2.5mm 3mm; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }
+  table.scope thead th { font-weight: 600; background: #fafafa; color: #555; }
+  table.scope tbody tr:hover { background: #f7f9fb; }
+  .qid { font-family: "SF Mono", Menlo, monospace; font-size: 0.85rem; color: #444; }
+  .prompt-preview { color: #555; max-width: 400px; font-size: 0.88rem; }
+  .tag-chip { display: inline-block; background: #e8f0fb; color: #2a5ca8; border-radius: 3pt;
+              padding: 0.5mm 2mm; font-size: 0.82rem; }
+  .btn { display: inline-block; padding: 1.5mm 3.5mm; border-radius: 2pt; text-decoration: none;
+         font-size: 0.85rem; cursor: pointer; border: none; }
+  .btn-oos { background: #f5e6e6; color: #9b2c2c; border: 1px solid #e8a8a8; }
+  .btn-oos:hover { background: #fde8e8; }
+  .btn-inscope { background: #e6f5ea; color: #276137; border: 1px solid #a8d8b0; }
+  .btn-inscope:hover { background: #d4edda; }
+  .mc-badge { font-size: 0.78rem; color: #888; margin-left: 4px; }
+  .nav-link { color: #336699; font-size: 0.9rem; text-decoration: none; }
+  .nav-link:hover { text-decoration: underline; }
+</style>
+
+<h1>Scope triage · {{ source.year }} Paper {{ source.paper }}</h1>
+<p style="color:#666; margin-bottom: 4mm;">
+  Source ID: {{ source.id }}.
+  Questions marked <em>out of scope</em> test topics dropped from the current Study Design
+  (e.g. pre-2023 Specialist mechanics / statics) and are excluded from all generated practice papers.
+  &nbsp;·&nbsp;
+  <a class="nav-link" href="/admin/diagrams/{{ source.id }}">→ Diagram annotation</a>
+  &nbsp;·&nbsp;
+  <a class="nav-link" href="/admin/sources">← Sources</a>
+</p>
+
+<section class="bucket">
+  <h2>In scope <span class="bucket-count">({{ in_scope|length }})</span></h2>
+  {% if in_scope %}
+    <table class="scope">
+      <thead>
+        <tr>
+          <th>Question</th>
+          <th>Marks</th>
+          <th>Prompt</th>
+          <th>Primary tag</th>
+          <th style="width:160px">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for q in in_scope %}
+        <tr id="row-{{ loop.index }}">
+          <td>
+            <span class="qid">{{ q.id }}</span>
+            {% if q.is_mc %}<span class="mc-badge">MC</span>{% endif %}
+          </td>
+          <td>{{ q.marks if q.marks is not none else '—' }}</td>
+          <td class="prompt-preview">
+            {{ (q.prompt_md or '')[:200] }}{% if (q.prompt_md or '')|length > 200 %}…{% endif %}
+          </td>
+          <td>
+            {% if q.aos %}
+              <span class="tag-chip">AoS {{ q.aos }} · {{ q.dot_point_sort_order }}</span>
+              <br><small style="color:#777">{{ (q.dot_point_text or '')[:80] }}{% if (q.dot_point_text or '')|length > 80 %}…{% endif %}</small>
+            {% else %}
+              <span style="color:#aaa">—</span>
+            {% endif %}
+          </td>
+          <td>
+            <button class="btn btn-oos" onclick="setScope('{{ q.id }}', true)">Mark out of scope</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p style="color:#888">No in-scope leaves — all questions have been triaged.</p>
+  {% endif %}
+</section>
+
+<section class="bucket">
+  <h2>Out of scope <span class="bucket-count">({{ out_of_scope|length }})</span></h2>
+  {% if out_of_scope %}
+    <table class="scope">
+      <thead>
+        <tr>
+          <th>Question</th>
+          <th>Marks</th>
+          <th>Prompt</th>
+          <th style="width:160px">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for q in out_of_scope %}
+        <tr id="oos-{{ loop.index }}">
+          <td>
+            <span class="qid">{{ q.id }}</span>
+            {% if q.is_mc %}<span class="mc-badge">MC</span>{% endif %}
+          </td>
+          <td>{{ q.marks if q.marks is not none else '—' }}</td>
+          <td class="prompt-preview">
+            {{ (q.prompt_md or '')[:200] }}{% if (q.prompt_md or '')|length > 200 %}…{% endif %}
+          </td>
+          <td>
+            <button class="btn btn-inscope" onclick="setScope('{{ q.id }}', false)">Undo (mark in scope)</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p style="color:#888">No questions flagged as out of scope yet.</p>
+  {% endif %}
+</section>
+
+<script>
+async function setScope(qid, outOfScope) {
+  const label = outOfScope ? "Mark as out of scope?" : "Restore as in scope?";
+  if (!confirm(label + "\n\n" + qid)) return;
+  let reason = "";
+  if (outOfScope) {
+    reason = prompt("Reason (e.g. 'mechanics — Newton's second law on inclined plane'):", "");
+    if (reason === null) return; // cancelled
+  }
+  const body = {question_id: qid, out_of_scope: outOfScope};
+  if (reason) body.reason = reason;
+  const r = await fetch("/admin/scope/save", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (r.ok) {
+    location.reload();
+  } else {
+    const txt = await r.text();
+    alert("Failed: " + txt);
+  }
+}
+</script>
+{% endblock %}

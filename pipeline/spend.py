@@ -111,9 +111,9 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
-def check_budget(budget_usd: float) -> None:
-    """Raise BudgetExceeded if cumulative spend exceeds the cap. Call before each API call."""
-    spent = total_spend()
+def check_budget(budget_usd: float, baseline_usd: float = 0.0) -> None:
+    """Raise BudgetExceeded if spend since baseline exceeds the cap. Call before each API call."""
+    spent = total_spend() - baseline_usd
     if spent >= budget_usd:
         raise BudgetExceeded(f"cumulative spend ${spent:.4f} >= budget ${budget_usd:.2f}")
 

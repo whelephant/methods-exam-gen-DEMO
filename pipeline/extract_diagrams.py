@@ -33,7 +33,7 @@ import fitz
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from pipeline.db import REPO_ROOT, connect
+from pipeline.db import DEFAULT_SUBJECT, REPO_ROOT, SUBJECTS, SubjectSpec, connect, subject_spec
 from pipeline.extract_questions import (
     ANTHROPIC_MODEL_IDS,
     _client,
@@ -59,7 +59,7 @@ DIAGRAM_DPI = 150  # lower than question-extraction DPI; bbox doesn't need pixel
 BBOX_PADDING = 0.005
 
 
-DIAGRAM_PROMPT = """You identify the bounding box of a SPECIFIC diagram on a single page of a VCE Mathematical Methods exam.
+DIAGRAM_PROMPT_TEMPLATE = """You identify the bounding box of a SPECIFIC diagram on a single page of a VCE {display_name} exam.
 
 # What counts as a "diagram"
 A diagram is a NON-TEXT visual element:
@@ -113,6 +113,7 @@ DIAGRAM_TOOL: dict[str, Any] = {
 
 
 def find_diagram_bbox(
+    spec: SubjectSpec,
     source_id: int,
     pdf_path: Path,
     year: int,
@@ -126,17 +127,19 @@ def find_diagram_bbox(
     b64 = base64.standard_b64encode(png).decode("ascii")
 
     user_msg = (
-        f"Page {page} of {year} Methods Paper {paper}. "
+        f"Page {page} of {year} {spec.display_name} Paper {paper}. "
         f"Find the diagram that belongs to question {question_id}. "
         f"The question text reads: {question_prompt[:400]}"
     )
+
+    diagram_prompt = DIAGRAM_PROMPT_TEMPLATE.replace("{display_name}", spec.display_name)
 
     t0 = time.time()
     try:
         resp = _client().messages.create(
             model=ANTHROPIC_MODEL_IDS[DIAGRAM_MODEL],
             max_tokens=1024,
-            system=[{"type": "text", "text": DIAGRAM_PROMPT,
+            system=[{"type": "text", "text": diagram_prompt,
                      "cache_control": {"type": "ephemeral"}}],
             tools=[DIAGRAM_TOOL],
             tool_choice={"type": "tool", "name": "record_diagram_bbox"},
@@ -214,11 +217,29 @@ def find_diagram_bbox(
     }
 
 
-# "DO NOT WRITE IN THIS AREA" stripes on a 624-wide A4 page. Methods papers alternate
-# between left and right edges depending on page binding/parity, so we conservatively
-# clamp the diagram bbox to exclude BOTH zones. Main content always lives in [50, 580].
-SIDEBAR_X_END_LEFT = 50       # left sidebar covers x = 0 .. 50ish
-SIDEBAR_X_START_RIGHT = 580   # right sidebar starts around x = 580
+# "DO NOT WRITE IN THIS AREA" stripes appear on both sides of each question page.
+# VCAA uses two page-width families:
+#   - 623.62pt: Methods 2019+ question pages — wider custom format
+#   - 595.28pt: standard A4 — all Specialist papers, Methods 2016–2018, and the
+#     formula-sheet pages at the back of every modern Methods paper
+# Sidebar text band measurements (taken from Methods 2019+ Q-pages and from
+# Specialist 2023 P1 page 2): the right sidebar text starts around x=570 on A4
+# pages, so we clamp to x=568 to leave a 2pt margin clear of sidebar text.
+# Width-based (not subject-based) dispatch so future formats slot in cleanly
+# and Methods 2016–2018 pages also get the correct A4 clamps.
+_SIDEBAR_BY_WIDTH: dict[int, tuple[int, int]] = {
+    624: (50, 580),   # Methods 2019+ question pages (page width 623.62pt)
+    595: (50, 568),   # standard A4 (Specialist 2016+, Methods 2016–2018, formula sheets)
+}
+
+
+def _sidebar_x_for(page_width: float) -> tuple[int, int]:
+    """(left_end, right_start) for the page's sidebars, dispatched by width."""
+    rounded = int(round(page_width))
+    if rounded in _SIDEBAR_BY_WIDTH:
+        return _SIDEBAR_BY_WIDTH[rounded]
+    # Fall back to A4 defaults — safer (slightly narrower) for any unfamiliar page.
+    return _SIDEBAR_BY_WIDTH[595]
 # How far outside the model's rough bbox we search for prose/labels when refining.
 REFINE_MARGIN_PT = 100
 # A text span is classified as PROSE (question text bracketing the diagram) when
@@ -246,7 +267,7 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
          tick numbers) that sit within ±5pt of the y-range and within ±60pt of the
          x-range. Question text and prose stay outside the y-band so they don't
          intrude.
-      6. Clamp to the [SIDEBAR_X_END_LEFT+5, SIDEBAR_X_START_RIGHT-5] band.
+      6. Clamp to the [sidebar_left+5, sidebar_right-5] band (per-page via _sidebar_x_for).
 
     Returns (refined_bbox, debug_info) or None if no diagram drawings were found
     (in which case the caller should fall back to the legacy text-bracketed refiner).
@@ -262,9 +283,10 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
     finally:
         src.close()
 
+    sidebar_left, sidebar_right = _sidebar_x_for(page_w)
     rough_area = max(1.0, (rx1 - rx0) * (ry1 - ry0))
     SLACK = 30           # pt — slack around the rough bbox when filtering drawings
-    CONTENT_WIDTH = SIDEBAR_X_START_RIGHT - SIDEBAR_X_END_LEFT
+    CONTENT_WIDTH = sidebar_right - sidebar_left
 
     # Collect prose-block y-bands so we can exclude drawings that overlap them.
     # PyMuPDF blocks group entire paragraphs even when full of CID-math fragments,
@@ -278,7 +300,7 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
         src2.close()
     prose_y_bands: list[tuple[float, float]] = []
     for x0b, y0b, x1b, y1b, text, _bno, _btype in prose_blocks_raw:
-        if x1b <= SIDEBAR_X_END_LEFT or x0b >= SIDEBAR_X_START_RIGHT:
+        if x1b <= sidebar_left or x0b >= sidebar_right:
             continue
         stripped = (text or "").strip().replace("\n", " ")
         if not stripped:
@@ -303,7 +325,7 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
         if (dx1 - dx0) * (dy1 - dy0) > 0.6 * rough_area * 4:
             continue
         # Exclude sidebar drawings entirely.
-        if dx1 <= SIDEBAR_X_END_LEFT or dx0 >= SIDEBAR_X_START_RIGHT:
+        if dx1 <= sidebar_left or dx0 >= sidebar_right:
             continue
         # Drop very wide, height-0 horizontal rules — these are answer-space working lines.
         if (dy1 - dy0) < 1 and (dx1 - dx0) > 0.6 * CONTENT_WIDTH:
@@ -348,7 +370,7 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
                 if len(txt) > 40:
                     continue
                 # Skip sidebar.
-                if tx1 <= SIDEBAR_X_END_LEFT or tx0 >= SIDEBAR_X_START_RIGHT:
+                if tx1 <= sidebar_left or tx0 >= sidebar_right:
                     continue
                 # Must be within the diagram's y-band plus a small margin.
                 if ty1 < y0 - Y_EXPAND_MARGIN or ty0 > y1 + Y_EXPAND_MARGIN:
@@ -382,7 +404,7 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
     prose_below_y: Optional[float] = None
     prose_above_y: Optional[float] = None
     for x0b, y0b, x1b, y1b, text, _bno, _btype in prose_blocks:
-        if x1b <= SIDEBAR_X_END_LEFT or x0b >= SIDEBAR_X_START_RIGHT:
+        if x1b <= sidebar_left or x0b >= sidebar_right:
             continue
         stripped = (text or "").strip().replace("\n", " ")
         if not stripped:
@@ -404,8 +426,8 @@ def _refine_bbox_via_drawings(pdf_path: Path, page: int, rough_bbox: list,
         y0 = max(y0, prose_above_y + 4)
 
     # Clamp to safe content area (avoid both sidebars).
-    x0 = max(x0, SIDEBAR_X_END_LEFT + 3)
-    x1 = min(x1, SIDEBAR_X_START_RIGHT - 3)
+    x0 = max(x0, sidebar_left + 3)
+    x1 = min(x1, sidebar_right - 3)
 
     debug = {
         "method": "drawings",
@@ -445,6 +467,7 @@ def refine_bbox(pdf_path: Path, page: int, rough_bbox: list,
     try:
         pg = src.load_page(page - 1)
         text_dict = pg.get_text("dict")
+        sidebar_left, sidebar_right = _sidebar_x_for(pg.rect.width)
     finally:
         src.close()
 
@@ -459,7 +482,7 @@ def refine_bbox(pdf_path: Path, page: int, rough_bbox: list,
                 bx0, by0, bx1, by1 = span["bbox"]
                 # Exclude spans that are entirely inside either sidebar stripe
                 # (rotated "DO NOT WRITE" letters on left or right edge).
-                if bx1 <= SIDEBAR_X_END_LEFT or bx0 >= SIDEBAR_X_START_RIGHT:
+                if bx1 <= sidebar_left or bx0 >= sidebar_right:
                     continue
                 if bx1 < sx0 or bx0 > sx1 or by1 < sy0 or by0 > sy1:
                     continue  # outside search region
@@ -515,8 +538,8 @@ def refine_bbox(pdf_path: Path, page: int, rough_bbox: list,
         diagram_x1 = max(diagram_x1, max(s[2] for s in labels_in_band) + 6)
 
     # Clamp to exclude both sidebar zones (left or right "DO NOT WRITE" stripe).
-    diagram_x0 = max(diagram_x0, SIDEBAR_X_END_LEFT + 5)
-    diagram_x1 = min(diagram_x1, SIDEBAR_X_START_RIGHT - 5)
+    diagram_x0 = max(diagram_x0, sidebar_left + 5)
+    diagram_x1 = min(diagram_x1, sidebar_right - 5)
 
     debug = {
         "original_bbox": list(rough_bbox),
@@ -560,7 +583,8 @@ def _filter_diagram_drawings(page) -> list:
     Useful both for audit-warning detection and (in principle) for future tooling.
     """
     page_w = page.rect.width
-    CONTENT_WIDTH = SIDEBAR_X_START_RIGHT - SIDEBAR_X_END_LEFT
+    sidebar_left, sidebar_right = _sidebar_x_for(page_w)
+    CONTENT_WIDTH = sidebar_right - sidebar_left
     page_area = page_w * page.rect.height
     kept = []
     for d in page.get_drawings():
@@ -572,7 +596,7 @@ def _filter_diagram_drawings(page) -> list:
         if dw * dh > 0.5 * page_area:
             continue
         # Sidebar drawings.
-        if r.x1 <= SIDEBAR_X_END_LEFT or r.x0 >= SIDEBAR_X_START_RIGHT:
+        if r.x1 <= sidebar_left or r.x0 >= sidebar_right:
             continue
         # Working-line answer rules: hairline horizontals running across most of content.
         if dh < 1 and dw > 0.6 * CONTENT_WIDTH:
@@ -762,6 +786,7 @@ def find_audit_pages(source_id: int) -> list:
             if p in skipped or p in pages_with_flagged:
                 continue
             page = doc.load_page(p - 1)
+            sidebar_left, sidebar_right = _sidebar_x_for(page.rect.width)
             kept_all = _filter_diagram_drawings(page)
             # Keep only "curve-like" drawings (non-zero area). Excludes pure
             # horizontal/vertical lines, which are mostly table grid lines and
@@ -773,7 +798,7 @@ def find_audit_pages(source_id: int) -> list:
             # but they're typography, not diagram content.
             prose_y_bands: list[tuple[float, float]] = []
             for x0b, y0b, x1b, y1b, text, _bno, _btype in page.get_text("blocks"):
-                if x1b <= SIDEBAR_X_END_LEFT or x0b >= SIDEBAR_X_START_RIGHT:
+                if x1b <= sidebar_left or x0b >= sidebar_right:
                     continue
                 stripped = (text or "").strip().replace("\n", " ")
                 if not stripped:
@@ -800,12 +825,13 @@ def find_audit_pages(source_id: int) -> list:
 # ─── main extract entry point ─────────────────────────────────────────
 
 
-def extract_one(question_id: str, *, force: bool = False, budget_usd: float = 1.00) -> dict:
+def extract_one(question_id: str, *, force: bool = False, budget_usd: float = 1.00,
+                baseline_usd: float = 0.0) -> dict:
     conn = connect()
     try:
         q = conn.execute(
             """
-            select q.*, s.year, s.paper, s.pdf_path
+            select q.*, s.subject as source_subject, s.year, s.paper, s.pdf_path
             from questions q join sources s on s.id = q.source_id
             where q.id = ? and q.has_diagram = 1
             """,
@@ -815,6 +841,7 @@ def extract_one(question_id: str, *, force: bool = False, budget_usd: float = 1.
         conn.close()
     if q is None:
         raise RuntimeError(f"question {question_id} not found or has_diagram=0")
+    spec = subject_spec(q["source_subject"])
 
     # Prefer a manual annotation when one exists — re-crop from the stored bbox,
     # zero API cost. Only fall through to vision if no manual bbox is stored.
@@ -849,9 +876,9 @@ def extract_one(question_id: str, *, force: bool = False, budget_usd: float = 1.
     found: Optional[dict] = None
     found_on_page: Optional[int] = None
     for p in range(q["source_page_start"], q["source_page_end"] + 1):
-        check_budget(budget_usd)
+        check_budget(budget_usd, baseline_usd)
         result = find_diagram_bbox(
-            q["source_id"], pdf_path, q["year"], q["paper"], p,
+            spec, q["source_id"], pdf_path, q["year"], q["paper"], p,
             question_id, q["prompt_md"],
         )
         if result:
@@ -1002,6 +1029,7 @@ def _panel_bboxes_from_anchors(anchors: list[dict], page_w: float, page_h: float
         OR the next row's anchor minus a small gap (whichever closer), OR page bottom.
       - Panel x extends from letter_x + small offset to either page midpoint (col 1) or
         right margin (col 2)."""
+    sidebar_left, sidebar_right = _sidebar_x_for(page_w)
     # Identify column midpoint from the x positions of the letters.
     xs = sorted(a["x_pt"] for a in anchors)
     if len(set(round(x, 0) for x in xs)) > 1:
@@ -1063,7 +1091,7 @@ def _panel_bboxes_from_anchors(anchors: list[dict], page_w: float, page_h: float
             sibling = _same_row_other_col(a)
             x_right = sibling["x_pt"] - RIGHT_COL_GAP if sibling else (page_w / 2 - 4)
         else:
-            x_right = SIDEBAR_X_START_RIGHT - 5
+            x_right = sidebar_right - 5
         bboxes.append([x_left, y_top, x_right, y_bot])
     return bboxes
 
@@ -1161,18 +1189,24 @@ def extract_mc_option_diagrams(question_id: str, *, force: bool = False) -> dict
     return {"question_id": question_id, "status": "ok", "options": results}
 
 
-def extract_paper_diagrams(year: int, paper: int, *, force: bool = False,
+def extract_paper_diagrams(subject: str, year: int, paper: int, *, force: bool = False,
                            budget_usd: float = 1.00) -> dict:
+    from pipeline.spend import total_spend
+    baseline_usd = total_spend()
+
+    # Validate that the subject is known; spec is unused here (extract_one looks it up
+    # from the question's source row) but the validation gives a clearer early error.
+    subject_spec(subject)
     conn = connect()
     try:
         rows = conn.execute(
             """
             select q.id from questions q
             join sources s on s.id = q.source_id
-            where s.year = ? and s.paper = ? and q.has_diagram = 1
+            where s.subject = ? and s.year = ? and s.paper = ? and q.has_diagram = 1
             order by q.question_number, q.part
             """,
-            (year, paper),
+            (subject, year, paper),
         ).fetchall()
         # MC questions whose options include diagrams. Detected by inspecting the
         # stored mc_options_md JSON for any entry with kind='diagram'.
@@ -1180,11 +1214,11 @@ def extract_paper_diagrams(year: int, paper: int, *, force: bool = False,
             """
             select q.id, q.mc_options_md from questions q
             join sources s on s.id = q.source_id
-            where s.year = ? and s.paper = ? and q.is_mc = 1
+            where s.subject = ? and s.year = ? and s.paper = ? and q.is_mc = 1
               and q.mc_options_md like '%"kind": "diagram"%'
             order by q.question_number
             """,
-            (year, paper),
+            (subject, year, paper),
         ).fetchall()
     finally:
         conn.close()
@@ -1192,7 +1226,7 @@ def extract_paper_diagrams(year: int, paper: int, *, force: bool = False,
     results = []
     for r in rows:
         try:
-            res = extract_one(r["id"], force=force, budget_usd=budget_usd)
+            res = extract_one(r["id"], force=force, budget_usd=budget_usd, baseline_usd=baseline_usd)
         except BudgetExceeded:
             raise
         results.append(res)
@@ -1209,7 +1243,7 @@ def extract_paper_diagrams(year: int, paper: int, *, force: bool = False,
         sys.stderr.write(f"  {r['id']}: {n_extracted} option diagrams extracted, {n_cached} cached\n")
 
     return {
-        "year": year, "paper": paper,
+        "subject": subject, "year": year, "paper": paper,
         "diagrams_total": len(rows),
         "mc_with_diagram_options": len(mc_rows),
         "results": results,
@@ -1221,7 +1255,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--year", type=int, help="year (must be paired with --paper)")
-    g.add_argument("--question", type=str, help="single question id, e.g. 2023-p1-q3-a")
+    g.add_argument("--question", type=str, help="single question id, e.g. 2023-p1-q3-a or sp-2023-p1-q3-a")
+    ap.add_argument("--subject", default=DEFAULT_SUBJECT, choices=sorted(SUBJECTS.keys()))
     ap.add_argument("--paper", type=int, choices=[1, 2])
     ap.add_argument("--force", action="store_true", help="re-extract even if SVG exists")
     ap.add_argument("--budget", type=float, default=1.00)
@@ -1229,11 +1264,12 @@ def main() -> int:
 
     try:
         if args.question:
+            # subject is derived from the question's source row in extract_one
             print(json.dumps(extract_one(args.question, force=args.force, budget_usd=args.budget), indent=2))
         else:
             if args.paper is None:
                 ap.error("--year requires --paper")
-            print(json.dumps(extract_paper_diagrams(args.year, args.paper, force=args.force, budget_usd=args.budget), indent=2))
+            print(json.dumps(extract_paper_diagrams(args.subject, args.year, args.paper, force=args.force, budget_usd=args.budget), indent=2))
     except BudgetExceeded as e:
         print(f"BUDGET EXCEEDED: {e}", file=sys.stderr)
         return 2

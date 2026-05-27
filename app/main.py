@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from pipeline.db import REPO_ROOT, connect
+from pipeline.db import REPO_ROOT, SUBJECTS, connect, subject_spec
 
 ADMIN_ENABLED = os.environ.get("ADMIN") == "1"
 
@@ -63,6 +63,7 @@ def _db():
 
 @app.get("/generate.pdf")
 def generate_pdf_route(
+    subject: str = Query("mathematical_methods"),
     year: Optional[int] = Query(None),
     paper: Optional[int] = Query(None),
     aos: Optional[list[int]] = Query(None, description="One or more AoS numbers — repeat the param for multiple, e.g. ?aos=1&aos=2"),
@@ -71,6 +72,7 @@ def generate_pdf_route(
     """Build a practice-paper PDF from the question DB.
 
     Selection:
+      - subject (default mathematical_methods) — scopes year/paper/aos lookup to one subject
       - year + paper → all leaf questions from that source
       - aos[+dot] → all questions tagged with that AoS (and optionally that dot point);
                     aos accepts multiple values (?aos=1&aos=2 → questions tagged AoS 1 OR 2)
@@ -78,8 +80,15 @@ def generate_pdf_route(
     """
     from app.render import generate_pdf  # local import to avoid Playwright at app boot
 
-    where = ["1 = 1"]
-    params: list = []
+    if subject not in SUBJECTS:
+        raise HTTPException(status_code=400, detail=f"unknown subject: {subject}")
+    spec = subject_spec(subject)
+
+    # Always exclude `out_of_scope` questions — these test topics dropped from the
+    # current Study Design (e.g. mechanics / statics for pre-2023 Specialist papers)
+    # and should never appear in practice papers for the current curriculum.
+    where = ["s.subject = ?", "q.out_of_scope = 0"]
+    params: list = [subject]
     if year is not None:
         where.append("s.year = ?")
         params.append(year)
@@ -88,11 +97,12 @@ def generate_pdf_route(
         params.append(paper)
     if aos:
         if dot is not None and len(aos) == 1:
-            where.append("exists (select 1 from question_tags t where t.question_id = q.id and t.aos = ? and t.dot_point_sort_order = ?)")
-            params.extend([aos[0], dot])
+            where.append("exists (select 1 from question_tags t where t.question_id = q.id and t.subject = ? and t.aos = ? and t.dot_point_sort_order = ?)")
+            params.extend([subject, aos[0], dot])
         else:
             placeholders = ",".join("?" * len(aos))
-            where.append(f"exists (select 1 from question_tags t where t.question_id = q.id and t.aos in ({placeholders}))")
+            where.append(f"exists (select 1 from question_tags t where t.question_id = q.id and t.subject = ? and t.aos in ({placeholders}))")
+            params.append(subject)
             params.extend(aos)
 
     # Restrict to leaf rows (real parts, or parentless wholes). Exclude sub_stems
@@ -126,8 +136,8 @@ def generate_pdf_route(
         with _db() as conn:
             ph = ",".join("?" * len(aos))
             rows = conn.execute(
-                f"select aos, title from study_areas where aos in ({ph}) order by aos",
-                aos,
+                f"select aos, title from study_areas where subject = ? and aos in ({ph}) order by aos",
+                [subject, *aos],
             ).fetchall()
         aos_labels = [f"AoS {r['aos']} ({r['title']})" for r in rows]
         if len(aos_labels) == 1 and dot is not None:
@@ -157,11 +167,12 @@ def generate_pdf_route(
             f" from questions where id in ({placeholders})",
             qids,
         ).fetchone()[0]
-    title = "VCE Mathematical Methods — practice paper"
+    title = f"VCE {spec.display_name} — practice paper"
     subtitle = f"{n_top} question{'s' if n_top != 1 else ''} from real past VCAA exams ({len(qids)} sub-parts)"
 
     pdf_bytes = generate_pdf(qids, title=title, subtitle=subtitle,
-                             filters_summary=filters_summary)
+                             filters_summary=filters_summary,
+                             subject_display_name=spec.display_name)
     fname_bits = []
     if year and paper: fname_bits.append(f"{year}_p{paper}")
     if aos:
@@ -169,7 +180,9 @@ def generate_pdf_route(
         if dot is not None and len(aos) == 1:
             aos_part += f"-dot{dot}"
         fname_bits.append(aos_part)
-    fname = "methods_practice_" + ("_".join(fname_bits) or "all") + ".pdf"
+    # Short subject slug for the filename: "methods" or "specialist"
+    subj_slug = {"mathematical_methods": "methods", "specialist_mathematics": "specialist"}.get(subject, subject)
+    fname = f"{subj_slug}_practice_" + ("_".join(fname_bits) or "all") + ".pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -178,21 +191,22 @@ def generate_pdf_route(
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
+def index(request: Request, subject: str = "mathematical_methods") -> HTMLResponse:
     """Generator form. Loads the AoS / dot-point taxonomy and basic corpus stats."""
+    if subject not in ("mathematical_methods", "specialist_mathematics"):
+        subject = "mathematical_methods"
     with _db() as conn:
         areas_rows = conn.execute(
-            """
-            select aos, title from study_areas
-            where subject = 'mathematical_methods' order by aos
-            """
+            "select aos, title from study_areas where subject = ? order by aos",
+            (subject,),
         ).fetchall()
         points_rows = conn.execute(
             """
             select aos, sort_order, text from study_points
-            where subject = 'mathematical_methods' and is_header = 0
+            where subject = ? and is_header = 0
             order by aos, sort_order
-            """
+            """,
+            (subject,),
         ).fetchall()
         stats = {
             "sources": conn.execute("select count(*) from sources").fetchone()[0],
@@ -845,3 +859,95 @@ def admin_diagrams_flag(payload: dict) -> dict:
         ).rowcount
         conn.commit()
     return {"question_id": qid, "updated": n}
+
+
+# ───── scope triage ──────────────────────────────────────────────────
+
+
+@app.get("/admin/scope/{sid}", response_class=HTMLResponse)
+def admin_scope_list(sid: int, request: Request) -> HTMLResponse:
+    """Two-bucket scope triage view for one source paper.
+    User flags questions whose content is no longer in the current Study Design
+    (e.g. pre-2023 Specialist mechanics/statics questions).
+    """
+    _admin_guard()
+    with _db() as conn:
+        source = conn.execute(
+            "select id, subject, year, paper from sources where id = ?", (sid,),
+        ).fetchone()
+        if source is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        # Leaf rows only — same definition as load_taggable in tag_questions.py.
+        leaves = conn.execute(
+            """
+            select q.id, q.section, q.question_number, q.part, q.marks,
+                   q.prompt_md, q.out_of_scope, q.is_mc,
+                   qt.aos, qt.dot_point_sort_order,
+                   sp.text as dot_point_text
+            from questions q
+            left join question_tags qt on qt.question_id = q.id and qt.is_primary = 1
+            left join study_points sp
+                   on sp.subject = ? and sp.aos = qt.aos
+                   and sp.sort_order = qt.dot_point_sort_order
+            where q.source_id = ?
+              and (
+                (q.part is not null and q.part not like 'pre-%%')
+                or not exists (
+                  select 1 from questions q2
+                  where q2.source_id = q.source_id
+                    and q2.section is q.section
+                    and q2.question_number = q.question_number
+                    and q2.part is not null
+                    and q2.part not like 'pre-%%'
+                )
+              )
+            order by case when q.section = 'A' then 0 when q.section = 'B' then 1 else 2 end,
+                     q.question_number,
+                     case when q.part is null then '' else q.part end
+            """,
+            (source["subject"], sid),
+        ).fetchall()
+    in_scope = [dict(r) for r in leaves if not r["out_of_scope"]]
+    out_of_scope = [dict(r) for r in leaves if r["out_of_scope"]]
+    return templates.TemplateResponse(
+        request,
+        "admin_scope.html",
+        {
+            "source": dict(source),
+            "in_scope": in_scope,
+            "out_of_scope": out_of_scope,
+        },
+    )
+
+
+@app.post("/admin/scope/save")
+def admin_scope_save(payload: dict) -> dict:
+    """Body: {question_id, out_of_scope: bool, reason?: str}.
+    Marks or unmarks a question as out-of-scope. Returns {"ok": true}.
+    """
+    _admin_guard()
+    from pipeline.tag_questions import mark_out_of_scope
+    qid = payload.get("question_id")
+    oos = payload.get("out_of_scope")
+    if not qid or oos is None:
+        raise HTTPException(status_code=400, detail="need question_id and out_of_scope")
+    with _db() as conn:
+        row = conn.execute(
+            "select source_id from questions where id = ?", (qid,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="question not found")
+        source_id = row["source_id"]
+    if oos:
+        reason = str(payload.get("reason") or "out of scope under current Study Design")
+        mark_out_of_scope(qid, source_id, reason)
+    else:
+        with _db() as conn:
+            conn.execute("update questions set out_of_scope = 0 where id = ?", (qid,))
+            conn.execute(
+                "update review_queue set resolved = 1 "
+                "where question_id = ? and reason = 'out_of_scope_under_current_design' and resolved = 0",
+                (qid,),
+            )
+            conn.commit()
+    return {"ok": True, "question_id": qid, "out_of_scope": bool(oos)}
